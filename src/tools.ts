@@ -3,6 +3,7 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 
 // Schema definitions
 export const SendEmailSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   to: z.array(z.string()).describe("List of recipient email addresses"),
   subject: z.string().describe("Email subject"),
   body: z.string().describe("Email body content (used for text/plain or when htmlBody not provided)"),
@@ -17,15 +18,18 @@ export const SendEmailSchema = z.object({
 });
 
 export const ReadEmailSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageId: z.string().describe("ID of the email message to retrieve"),
 });
 
 export const SearchEmailsSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   query: z.string().describe("Gmail search query (e.g., 'from:example@gmail.com')"),
   maxResults: z.number().optional().describe("Maximum number of results to return"),
 });
 
 export const ModifyEmailSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageId: z.string().describe("ID of the email message to modify"),
   labelIds: z.array(z.string()).optional().describe("List of label IDs to apply"),
   addLabelIds: z.array(z.string()).optional().describe("List of label IDs to add to the message"),
@@ -33,19 +37,23 @@ export const ModifyEmailSchema = z.object({
 });
 
 export const DeleteEmailSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageId: z.string().describe("ID of the email message to delete"),
 });
 
 // Draft lifecycle schemas
 export const SendDraftSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   draftId: z.string().describe("ID of the draft to send (returned by draft_email)"),
 });
 
 export const DeleteDraftSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   draftId: z.string().describe("ID of the draft to delete"),
 });
 
 export const UpdateDraftSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   draftId: z.string().describe("ID of the draft to update"),
   to: z.array(z.string()).describe("List of recipient email addresses"),
   subject: z.string().describe("Email subject"),
@@ -60,15 +68,19 @@ export const UpdateDraftSchema = z.object({
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
 });
 
-export const ListEmailLabelsSchema = z.object({}).describe("Retrieves all available Gmail labels");
+export const ListEmailLabelsSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
+}).describe("Retrieves all available Gmail labels");
 
 export const CreateLabelSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   name: z.string().describe("Name for the new label"),
   messageListVisibility: z.enum(['show', 'hide']).optional().describe("Whether to show or hide the label in the message list"),
   labelListVisibility: z.enum(['labelShow', 'labelShowIfUnread', 'labelHide']).optional().describe("Visibility of the label in the label list"),
 }).describe("Creates a new Gmail label");
 
 export const UpdateLabelSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   id: z.string().describe("ID of the label to update"),
   name: z.string().optional().describe("New name for the label"),
   messageListVisibility: z.enum(['show', 'hide']).optional().describe("Whether to show or hide the label in the message list"),
@@ -76,16 +88,19 @@ export const UpdateLabelSchema = z.object({
 }).describe("Updates an existing Gmail label");
 
 export const DeleteLabelSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   id: z.string().describe("ID of the label to delete"),
 }).describe("Deletes a Gmail label");
 
 export const GetOrCreateLabelSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   name: z.string().describe("Name of the label to get or create"),
   messageListVisibility: z.enum(['show', 'hide']).optional().describe("Whether to show or hide the label in the message list"),
   labelListVisibility: z.enum(['labelShow', 'labelShowIfUnread', 'labelHide']).optional().describe("Visibility of the label in the label list"),
 }).describe("Gets an existing label by name or creates it if it doesn't exist");
 
 export const BatchModifyEmailsSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageIds: z.array(z.string()).describe("List of message IDs to modify"),
   addLabelIds: z.array(z.string()).optional().describe("List of label IDs to add to all messages"),
   removeLabelIds: z.array(z.string()).optional().describe("List of label IDs to remove from all messages"),
@@ -93,20 +108,24 @@ export const BatchModifyEmailsSchema = z.object({
 });
 
 export const ReportPhishingSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageId: z.string().describe("ID of the email message to report as phishing"),
 }).describe("Reports a message as phishing using the closest public Gmail API behavior by applying the SPAM label");
 
 export const BatchReportPhishingSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageIds: z.array(z.string()).describe("List of message IDs to report as phishing"),
   batchSize: z.number().optional().default(50).describe("Number of messages to process in each batch (default: 50)"),
 }).describe("Reports multiple messages as phishing using the closest public Gmail API behavior by applying the SPAM label");
 
 export const BatchDeleteEmailsSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageIds: z.array(z.string()).describe("List of message IDs to delete"),
   batchSize: z.number().optional().default(50).describe("Number of messages to process in each batch (default: 50)"),
 });
 
 export const CreateFilterSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   criteria: z.object({
     from: z.string().optional().describe("Sender email address to match"),
     to: z.string().optional().describe("Recipient email address to match"),
@@ -125,17 +144,22 @@ export const CreateFilterSchema = z.object({
   }).describe("Actions to perform on matching emails")
 }).describe("Creates a new Gmail filter");
 
-export const ListFiltersSchema = z.object({}).describe("Retrieves all Gmail filters");
+export const ListFiltersSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
+}).describe("Retrieves all Gmail filters");
 
 export const GetFilterSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   filterId: z.string().describe("ID of the filter to retrieve")
 }).describe("Gets details of a specific Gmail filter");
 
 export const DeleteFilterSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   filterId: z.string().describe("ID of the filter to delete")
 }).describe("Deletes a Gmail filter");
 
 export const CreateFilterFromTemplateSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   template: z.enum(['fromSender', 'withSubject', 'withAttachments', 'largeEmails', 'containingText', 'mailingList']).describe("Pre-defined filter template to use"),
   parameters: z.object({
     senderEmail: z.string().optional().describe("Sender email (for fromSender template)"),
@@ -151,6 +175,7 @@ export const CreateFilterFromTemplateSchema = z.object({
 }).describe("Creates a filter using a pre-defined template");
 
 export const DownloadAttachmentSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageId: z.string().describe("ID of the email message containing the attachment"),
   attachmentId: z.string().describe("ID of the attachment to download"),
   filename: z.string().optional().describe("Filename to save the attachment as (if not provided, uses original filename)"),
@@ -158,6 +183,7 @@ export const DownloadAttachmentSchema = z.object({
 });
 
 export const DownloadEmailSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageId: z.string().describe("ID of the email message to download"),
   savePath: z.string().describe("Directory path to save the email file"),
   format: z.enum(['json', 'eml', 'txt', 'html']).optional().default('json')
@@ -165,6 +191,7 @@ export const DownloadEmailSchema = z.object({
 });
 
 export const ModifyThreadSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   threadId: z.string().describe("ID of the Gmail thread to modify"),
   addLabelIds: z.array(z.string()).optional().describe("List of label IDs to add to all messages in the thread"),
   removeLabelIds: z.array(z.string()).optional().describe("List of label IDs to remove from all messages in the thread"),
@@ -172,16 +199,19 @@ export const ModifyThreadSchema = z.object({
 
 // Thread-level schemas
 export const GetThreadSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   threadId: z.string().describe("ID of the email thread to retrieve"),
   format: z.enum(['full', 'metadata', 'minimal']).optional().default('full').describe("Format of the email messages returned (default: full)"),
 });
 
 export const ListInboxThreadsSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   query: z.string().optional().default('in:inbox').describe("Gmail search query (default: 'in:inbox')"),
   maxResults: z.number().optional().default(50).describe("Maximum number of threads to return (default: 50)"),
 });
 
 export const GetInboxWithThreadsSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   query: z.string().optional().default('in:inbox').describe("Gmail search query (default: 'in:inbox')"),
   maxResults: z.number().optional().default(50).describe("Maximum number of threads to return (default: 50)"),
   expandThreads: z.boolean().optional().default(true).describe("Whether to fetch full thread content for each thread (default: true)"),
@@ -189,12 +219,44 @@ export const GetInboxWithThreadsSchema = z.object({
 
 // Reply All schema - fetches original email and builds recipient list automatically
 export const ReplyAllSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageId: z.string().describe("ID of the email message to reply to"),
   body: z.string().describe("Reply body content (used for text/plain or when htmlBody not provided)"),
   htmlBody: z.string().optional().describe("HTML version of the reply body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
   attachments: z.array(z.string()).optional().describe("List of file paths to attach to the reply"),
 });
+
+// --- NEW SCHEMAS FOR MULTI-ACCOUNT & SCHEDULING ---
+
+export const ListAccountsSchema = z.object({}).describe("Lists all currently authenticated Gmail accounts");
+
+export const ScheduleEmailSchema = z.object({
+  account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
+  to: z.array(z.string()).describe("List of recipient email addresses"),
+  subject: z.string().describe("Email subject"),
+  body: z.string().describe("Email body content (used for text/plain or when htmlBody not provided)"),
+  htmlBody: z.string().optional().describe("HTML version of the email body"),
+  cc: z.array(z.string()).optional().describe("List of CC recipients"),
+  bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
+  threadId: z.string().optional().describe("Thread ID to reply to"),
+  inReplyTo: z.string().optional().describe("Message ID being replied to"),
+  attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
+  scheduledTime: z.string().describe("ISO 8601 timestamp (e.g., '2026-05-28T15:00:00Z') or relative time string (e.g., '+5 minutes', '+2 hours', '+1 day') when the email should be sent."),
+});
+
+export const ListScheduledEmailsSchema = z.object({
+  status: z.enum(['pending', 'sent', 'failed']).optional().describe("Filter scheduled emails by status"),
+}).describe("Lists scheduled emails and their status");
+
+export const CancelScheduledEmailSchema = z.object({
+  id: z.string().describe("The unique ID of the scheduled email to cancel"),
+}).describe("Cancels a pending scheduled email");
+
+export const AuthenticateAccountSchema = z.object({
+  email: z.string().describe("The Gmail address of the account you want to authenticate/register (e.g., 'user@gmail.com')."),
+  scopes: z.array(z.string()).optional().describe("Optional list of scope names to request (e.g. ['gmail.readonly', 'gmail.send']). Defaults to standard sending & management scopes if not provided.")
+}).describe("Initiates interactive OAuth authentication for a new Gmail account. Returns an authentication URL and starts a local listener.");
 
 // Tool definition type
 export interface ToolAnnotations {
@@ -435,6 +497,43 @@ export const toolDefinitions: ToolDefinition[] = [
     schema: ReplyAllSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Reply All", destructiveHint: false },
+  },
+
+  // --- NEW TOOLS FOR MULTI-ACCOUNT & SCHEDULING ---
+  {
+    name: "list_accounts",
+    description: "Lists all currently authenticated Gmail accounts connected to this MCP server.",
+    schema: ListAccountsSchema,
+    scopes: ["gmail.readonly", "gmail.modify"],
+    annotations: { title: "List Accounts", readOnlyHint: true },
+  },
+  {
+    name: "schedule_email",
+    description: "Schedules an email to be sent at a specific time in the future (ISO 8601 string or relative notation like '+5 minutes'). Saves to local offline queue.",
+    schema: ScheduleEmailSchema,
+    scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
+    annotations: { title: "Schedule Email", destructiveHint: false },
+  },
+  {
+    name: "list_scheduled_emails",
+    description: "Lists all scheduled emails in the local queue, along with their status (pending, sent, failed).",
+    schema: ListScheduledEmailsSchema,
+    scopes: ["gmail.readonly", "gmail.modify"],
+    annotations: { title: "List Scheduled Emails", readOnlyHint: true },
+  },
+  {
+    name: "cancel_scheduled_email",
+    description: "Cancels a pending scheduled email, removing it from the local database.",
+    schema: CancelScheduledEmailSchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Cancel Scheduled Email", destructiveHint: true },
+  },
+  {
+    name: "authenticate_account",
+    description: "Registers and authenticates a new Gmail account through Google OAuth. This opens a browser window automatically for permissions approval.",
+    schema: AuthenticateAccountSchema,
+    scopes: ["gmail.readonly", "gmail.modify"],
+    annotations: { title: "Authenticate Account", destructiveHint: false },
   },
 ];
 

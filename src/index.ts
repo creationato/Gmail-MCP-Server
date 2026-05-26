@@ -2,6 +2,8 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import express from "express";
 import {
     CallToolRequestSchema,
     ListToolsRequestSchema,
@@ -19,8 +21,17 @@ import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, get
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ScheduleEmailSchema, ListScheduledEmailsSchema, CancelScheduledEmailSchema, AuthenticateAccountSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
+import {
+    listAuthenticatedAccounts,
+    isAccountAuthenticated,
+    getAccountCredentialsPath,
+    loadQueue,
+    saveQueue,
+    ensureDirectories,
+    ScheduledEmail
+} from "./db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -28,6 +39,170 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
 const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
 const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
+
+// Dynamically resolve account credentials
+async function getAccountClient(accountEmail?: string): Promise<{ gmail: any; authorizedScopes: string[]; oauthClient: OAuth2Client }> {
+    ensureDirectories();
+
+    if (!fs.existsSync(OAUTH_PATH)) {
+        throw new Error(`OAuth keys file not found at ${OAUTH_PATH}. Please place gcp-oauth.keys.json in the ~/.gmail-mcp directory.`);
+    }
+    const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
+    const keys = keysContent.installed || keysContent.web;
+    if (!keys) {
+        throw new Error('Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
+    }
+
+    let credPath = CREDENTIALS_PATH;
+    let activeEmail = accountEmail;
+
+    if (accountEmail) {
+        credPath = getAccountCredentialsPath(accountEmail);
+        if (!fs.existsSync(credPath)) {
+            throw new Error(`Account "${accountEmail}" is not authenticated. Please run the auth command: node dist/index.js auth --account=${accountEmail}`);
+        }
+    } else {
+        const accounts = listAuthenticatedAccounts();
+        if (accounts.length > 0) {
+            activeEmail = accounts[0];
+            credPath = getAccountCredentialsPath(activeEmail);
+        } else if (!fs.existsSync(CREDENTIALS_PATH)) {
+            throw new Error('No authenticated accounts found. Please authenticate an account first.');
+        }
+    }
+
+    const oauthClient = new OAuth2Client(
+        keys.client_id,
+        keys.client_secret,
+        "http://localhost:3000/oauth2callback"
+    );
+
+    let scopes = DEFAULT_SCOPES;
+    if (fs.existsSync(credPath)) {
+        const credentials = JSON.parse(fs.readFileSync(credPath, 'utf8'));
+        const tokens = credentials.tokens || credentials;
+        oauthClient.setCredentials(tokens);
+        if (credentials.scopes) {
+            scopes = credentials.scopes;
+        }
+    } else {
+        throw new Error(`Credentials file not found at ${credPath}`);
+    }
+
+    const gmail = google.gmail({ version: 'v1', auth: oauthClient });
+    return { gmail, authorizedScopes: scopes, oauthClient };
+}
+
+function parseScheduledTime(timeStr: string): string {
+    const relativeMatch = timeStr.match(/^\+(\d+)\s+(minute|minutes|hour|hours|day|days)$/i);
+    if (relativeMatch) {
+        const amount = parseInt(relativeMatch[1], 10);
+        const unit = relativeMatch[2].toLowerCase();
+        const date = new Date();
+        if (unit.startsWith('minute')) {
+            date.setMinutes(date.getMinutes() + amount);
+        } else if (unit.startsWith('hour')) {
+            date.setHours(date.getHours() + amount);
+        } else if (unit.startsWith('day')) {
+            date.setDate(date.getDate() + amount);
+        }
+        return date.toISOString();
+    }
+    
+    const parsed = Date.parse(timeStr);
+    if (isNaN(parsed)) {
+        throw new Error(`Invalid scheduledTime format: "${timeStr}". Must be an ISO timestamp or relative duration (e.g., '+5 minutes').`);
+    }
+    return new Date(parsed).toISOString();
+}
+
+async function startSchedulerDaemon() {
+    console.log('Starting Gmail MCP Scheduler Daemon...');
+    ensureDirectories();
+    
+    while (true) {
+        try {
+            const queue = loadQueue();
+            const now = new Date();
+            const pending = queue.filter(item => item.status === 'pending' && new Date(item.scheduledTime) <= now);
+            
+            if (pending.length > 0) {
+                console.log(`Found ${pending.length} pending scheduled emails to send.`);
+                
+                for (const email of pending) {
+                    const jitter = Math.floor(Math.random() * 40000) + 5000;
+                    console.log(`Scheduling send for email ID ${email.id} from ${email.account} with random organic jitter of ${Math.round(jitter/1000)}s...`);
+                    await new Promise(resolve => setTimeout(resolve, jitter));
+                    
+                    try {
+                        const { gmail } = await getAccountClient(email.account);
+                        console.log(`Sending email ${email.id} using account ${email.account}...`);
+                        
+                        let rawMessage;
+                        if (email.attachments && email.attachments.length > 0) {
+                            rawMessage = await createEmailWithNodemailer({
+                                to: email.to,
+                                subject: email.subject,
+                                body: email.body,
+                                htmlBody: email.htmlBody,
+                                cc: email.cc,
+                                bcc: email.bcc,
+                                threadId: email.threadId,
+                                inReplyTo: email.inReplyTo,
+                                attachments: email.attachments
+                            });
+                        } else {
+                            rawMessage = createEmailMessage({
+                                to: email.to,
+                                subject: email.subject,
+                                body: email.body,
+                                htmlBody: email.htmlBody,
+                                cc: email.cc,
+                                bcc: email.bcc,
+                                threadId: email.threadId,
+                                inReplyTo: email.inReplyTo
+                            });
+                        }
+                        
+                        const encodedMessage = Buffer.from(rawMessage).toString('base64')
+                            .replace(/\+/g, '-')
+                            .replace(/\//g, '_')
+                            .replace(/=+$/, '');
+                            
+                        const result = await gmail.users.messages.send({
+                            userId: 'me',
+                            requestBody: {
+                                raw: encodedMessage,
+                                ...(email.threadId && { threadId: email.threadId })
+                            }
+                        });
+                        
+                        email.status = 'sent';
+                        email.actualSentTime = new Date().toISOString();
+                        email.attempts++;
+                        console.log(`Successfully sent email ID ${email.id}! Gmail Message ID: ${result.data.id}`);
+                    } catch (sendError) {
+                        email.attempts++;
+                        console.error(`Failed to send email ID ${email.id} (Attempt ${email.attempts}):`, (sendError as any).message);
+                        
+                        if (email.attempts >= 3) {
+                            email.status = 'failed';
+                            email.errorMessage = (sendError as any).message;
+                        }
+                    }
+                    
+                    saveQueue(queue);
+                }
+            }
+        } catch (loopError) {
+            console.error('Error in scheduler loop iteration:', (loopError as any).message);
+        }
+        
+        const checkSleep = Math.floor(50000 + Math.random() * 20000);
+        console.log(`Scheduler sleeping for ${Math.round(checkSleep/1000)} seconds before next queue check...`);
+        await new Promise(resolve => setTimeout(resolve, checkSleep));
+    }
+}
 
 // Type definitions for Gmail API responses
 interface GmailMessagePart {
@@ -193,26 +368,46 @@ async function loadCredentials() {
                 authorizedScopes = credentials.scopes;
             }
         }
-    } catch (error) {
+    } catch (error: any) {
         console.error('Error loading credentials:', error);
         process.exit(1);
     }
 }
 
-async function authenticate(scopes: string[]) {
+async function authenticate(scopes: string[], accountEmail?: string) {
     const server = http.createServer();
     server.listen(3000, '127.0.0.1');
 
-    // Convert shorthand scope names (e.g., "gmail.readonly") to full Google API URLs
     const scopeUrls = scopeNamesToUrls(scopes);
 
+    if (!fs.existsSync(OAUTH_PATH)) {
+        console.error('Error: OAuth keys file not found. Please place gcp-oauth.keys.json in', CONFIG_DIR);
+        process.exit(1);
+    }
+    const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
+    const keys = keysContent.installed || keysContent.web;
+    if (!keys) {
+        console.error('Error: Invalid OAuth keys file format.');
+        process.exit(1);
+    }
+
+    const tempOauthClient = new OAuth2Client(
+        keys.client_id,
+        keys.client_secret,
+        "http://localhost:3000/oauth2callback"
+    );
+
     return new Promise<void>((resolve, reject) => {
-        const authUrl = oauth2Client.generateAuthUrl({
+        const authUrl = tempOauthClient.generateAuthUrl({
             access_type: 'offline',
             scope: scopeUrls,
+            prompt: 'consent',
         });
 
         console.log('Requesting scopes:', scopes.join(', '));
+        if (accountEmail) {
+            console.log(`Authenticating for account: ${accountEmail}`);
+        }
         console.log('Please visit this URL to authenticate:', authUrl);
         open(authUrl);
 
@@ -230,16 +425,19 @@ async function authenticate(scopes: string[]) {
             }
 
             try {
-                const { tokens } = await oauth2Client.getToken(code);
-                oauth2Client.setCredentials(tokens);
-
-                // Store both tokens and authorized scopes for runtime filtering
+                const { tokens } = await tempOauthClient.getToken(code);
                 const credentials = { tokens, scopes };
-                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+                
+                let targetCredPath = CREDENTIALS_PATH;
+                if (accountEmail) {
+                    targetCredPath = getAccountCredentialsPath(accountEmail);
+                }
+                
+                fs.writeFileSync(targetCredPath, JSON.stringify(credentials, null, 2), { mode: 0o600 });
 
                 res.writeHead(200);
                 res.end('Authentication successful! You can close this window.');
-                console.log('Credentials saved with scopes:', scopes.join(', '));
+                console.log('Credentials saved to:', targetCredPath);
                 server.close();
                 resolve();
             } catch (error) {
@@ -251,16 +449,91 @@ async function authenticate(scopes: string[]) {
     });
 }
 
+function startOAuthFlow(scopes: string[], accountEmail: string): string {
+    if (!fs.existsSync(OAUTH_PATH)) {
+        throw new Error(`OAuth keys file not found at ${OAUTH_PATH}. Please place gcp-oauth.keys.json in the ~/.gmail-mcp directory.`);
+    }
+    const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, "utf8"));
+    const keys = keysContent.installed || keysContent.web;
+    if (!keys) {
+        throw new Error("Invalid OAuth keys file format.");
+    }
+
+    const scopeUrls = scopeNamesToUrls(scopes);
+    const tempOauthClient = new OAuth2Client(
+        keys.client_id,
+        keys.client_secret,
+        "http://localhost:3000/oauth2callback"
+    );
+
+    const authUrl = tempOauthClient.generateAuthUrl({
+        access_type: "offline",
+        scope: scopeUrls,
+        prompt: "consent",
+    });
+
+    const server = http.createServer();
+    server.listen(3000, "127.0.0.1");
+
+    server.on("request", async (req, res) => {
+        if (!req.url?.startsWith("/oauth2callback")) return;
+
+        const url = new URL(req.url, "http://localhost:3000");
+        const code = url.searchParams.get("code");
+
+        if (!code) {
+            res.writeHead(400);
+            res.end("No code provided");
+            server.close();
+            return;
+        }
+
+        try {
+            const { tokens } = await tempOauthClient.getToken(code);
+            const credentials = { tokens, scopes };
+            const targetCredPath = getAccountCredentialsPath(accountEmail);
+            
+            fs.writeFileSync(targetCredPath, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+
+            res.writeHead(200);
+            res.end("Authentication successful! You can close this window.");
+            console.log(`Successfully authenticated account ${accountEmail} and saved credentials.`);
+            server.close();
+        } catch (error) {
+            res.writeHead(500);
+            res.end("Authentication failed");
+            console.error("OAuth token exchange failed:", (error as any).message);
+            server.close();
+        }
+    });
+
+    setTimeout(() => {
+        server.close();
+    }, 5 * 60 * 1000);
+
+    open(authUrl);
+
+    return authUrl;
+}
+
 // Main function
 async function main() {
-    await loadCredentials();
+    ensureDirectories();
+    
+    // CLI Scheduler Trigger
+    if (process.argv[2] === 'scheduler') {
+        await startSchedulerDaemon();
+        return;
+    }
 
     if (process.argv[2] === 'auth') {
-        // Parse --scopes flag from CLI arguments
-        // Usage: node dist/index.js auth --scopes=<scope1,scope2,...>
-        // Example: node dist/index.js auth --scopes=gmail.readonly
-        // Example: node dist/index.js auth --scopes=gmail.readonly,gmail.settings.basic
         const scopesArg = process.argv.find(arg => arg.startsWith('--scopes='));
+        const accountArg = process.argv.find(arg => arg.startsWith('--account='));
+        let accountEmail;
+        if (accountArg) {
+            accountEmail = accountArg.slice('--account='.length);
+        }
+        
         let scopes = DEFAULT_SCOPES;
 
         if (scopesArg) {
@@ -270,16 +543,12 @@ async function main() {
 
             if (!validation.valid) {
                 console.error('Error: Invalid scope(s):', validation.invalid.join(', '));
-                console.error('Available scopes:', getAvailableScopeNames().join(', '));
                 process.exit(1);
             }
-        } else {
-            console.log('No --scopes flag specified, using defaults:', DEFAULT_SCOPES.join(', '));
-            console.log('Tip: Use --scopes=gmail.readonly for read-only access');
-            console.log('Available scopes:', getAvailableScopeNames().join(', '));
         }
-
-        await authenticate(scopes);
+        
+        await loadCredentials();
+        await authenticate(scopes, accountEmail);
         console.log('Authentication completed successfully');
         process.exit(0);
     }
@@ -287,39 +556,70 @@ async function main() {
     // Initialize Gmail API
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-    // Server implementation
-    const server = new Server(
-        {
-            name: "gmail",
-            version: "1.0.0",
-        },
-        {
-            capabilities: {
-                tools: {},
+    // Function to create a server instance and register all handlers
+    function createMcpServer(): Server {
+        const server = new Server(
+            {
+                name: "gmail",
+                version: "1.0.0",
             },
-        },
-    );
+            {
+                capabilities: {
+                    tools: {},
+                },
+            },
+        );
 
     // Tool handlers
     // Filter available tools based on authorized scopes
     server.setRequestHandler(ListToolsRequestSchema, async () => {
+        let scopes = DEFAULT_SCOPES;
+        try {
+            const clientInfo = await getAccountClient();
+            scopes = clientInfo.authorizedScopes;
+        } catch (e) {
+            // Keep default scopes if no primary credentials found
+        }
         const availableTools = toolDefinitions.filter(tool =>
-            hasScope(authorizedScopes, tool.scopes)
+            hasScope(scopes, tool.scopes)
         );
         return { tools: toMcpTools(availableTools) };
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const { name, arguments: args } = request.params;
+        const validatedArgs = args as any;
 
-        // Verify the tool is authorized for the current scopes
-        // This guards against direct tool calls that bypass ListTools
         const toolDef = getToolByName(name);
-        if (!toolDef || !hasScope(authorizedScopes, toolDef.scopes)) {
+        if (!toolDef) {
             return {
                 content: [{
                     type: "text",
-                    text: `Error: Tool "${name}" is not available. You may need to re-authenticate with additional scopes.`,
+                    text: `Error: Tool "${name}" is not found.`,
+                }],
+            };
+        }
+
+        // Dynamically resolve client for requested account
+        let gmailClientInfo;
+        try {
+            gmailClientInfo = await getAccountClient(validatedArgs?.account);
+        } catch (error) {
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error resolving Gmail client: ${(error as any).message}`,
+                }],
+            };
+        }
+
+        const { gmail, authorizedScopes } = gmailClientInfo;
+
+        if (!hasScope(authorizedScopes, toolDef.scopes)) {
+            return {
+                content: [{
+                    type: "text",
+                    text: `Error: Tool "${name}" is not authorized for the scopes available on account "${validatedArgs?.account || 'primary'}". Authorized scopes: ${authorizedScopes.join(', ')}`,
                 }],
             };
         }
@@ -345,7 +645,7 @@ async function main() {
                             for (const msg of threadMessages) {
                                 const msgHeaders = msg.payload?.headers || [];
                                 const messageIdHeader = msgHeaders.find(
-                                    (h) => h.name?.toLowerCase() === 'message-id'
+                                    (h: any) => h.name?.toLowerCase() === 'message-id'
                                 );
                                 if (messageIdHeader?.value) {
                                     allMessageIds.push(messageIdHeader.value);
@@ -356,7 +656,7 @@ async function main() {
                             const lastMessage = threadMessages[threadMessages.length - 1];
                             const lastHeaders = lastMessage.payload?.headers || [];
                             const lastMessageId = lastHeaders.find(
-                                (h) => h.name?.toLowerCase() === 'message-id'
+                                (h: any) => h.name?.toLowerCase() === 'message-id'
                             )?.value;
 
                             if (lastMessageId) {
@@ -522,6 +822,108 @@ async function main() {
 
         try {
             switch (name) {
+                // --- NEW SCHEDULING & ACCOUNT LISTING TOOLS ---
+                case "list_accounts": {
+                    const accounts = listAuthenticatedAccounts();
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify({ accounts }, null, 2),
+                        }],
+                    };
+                }
+
+                case "authenticate_account": {
+                    const authArgs = AuthenticateAccountSchema.parse(args);
+                    const scopes = authArgs.scopes || ["gmail.modify", "gmail.compose", "gmail.send"];
+                    const authUrl = startOAuthFlow(scopes, authArgs.email);
+                    
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Successfully initiated Google OAuth registration for account: "${authArgs.email}".\n\nA web browser window has been automatically opened on your machine to authorize the requested permissions.\n\nIf the browser window did not open automatically, please click on or visit the following link to authorize:\n\n${authUrl}\n\nOnce authorized, the credentials will be securely saved locally, and you can immediately begin utilizing this account!`,
+                        }],
+                    };
+                }
+
+                case "schedule_email": {
+                    const scheduleArgs = ScheduleEmailSchema.parse(args);
+                    const targetTime = parseScheduledTime(scheduleArgs.scheduledTime);
+                    
+                    let account = scheduleArgs.account;
+                    if (!account) {
+                        const accounts = listAuthenticatedAccounts();
+                        account = accounts[0] || "default";
+                    }
+                    
+                    const id = Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+                    const newEmail: ScheduledEmail = {
+                        id,
+                        account,
+                        to: scheduleArgs.to,
+                        subject: scheduleArgs.subject,
+                        body: scheduleArgs.body,
+                        htmlBody: scheduleArgs.htmlBody,
+                        cc: scheduleArgs.cc,
+                        bcc: scheduleArgs.bcc,
+                        threadId: scheduleArgs.threadId,
+                        inReplyTo: scheduleArgs.inReplyTo,
+                        attachments: scheduleArgs.attachments,
+                        scheduledTime: targetTime,
+                        status: 'pending',
+                        attempts: 0
+                    };
+                    
+                    const queue = loadQueue();
+                    queue.push(newEmail);
+                    saveQueue(queue);
+                    
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Email successfully scheduled for account "${account}" to be sent at ${targetTime}. ID: ${id}`,
+                        }],
+                    };
+                }
+
+                case "list_scheduled_emails": {
+                    const listArgs = ListScheduledEmailsSchema.parse(args);
+                    const queue = loadQueue();
+                    const filtered = listArgs.status 
+                        ? queue.filter(e => e.status === listArgs.status)
+                        : queue;
+                        
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify(filtered, null, 2),
+                        }],
+                    };
+                }
+
+                case "cancel_scheduled_email": {
+                    const cancelArgs = CancelScheduledEmailSchema.parse(args);
+                    const queue = loadQueue();
+                    const initialLength = queue.length;
+                    const filtered = queue.filter(e => e.id !== cancelArgs.id);
+                    
+                    if (filtered.length === initialLength) {
+                        return {
+                            content: [{
+                                type: "text",
+                                text: `Error: Scheduled email with ID "${cancelArgs.id}" not found.`,
+                            }],
+                        };
+                    }
+                    
+                    saveQueue(filtered);
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Successfully cancelled scheduled email with ID "${cancelArgs.id}".`,
+                        }],
+                    };
+                }
                 case "send_email":
                 case "draft_email": {
                     const validatedArgs = SendEmailSchema.parse(args);
@@ -572,7 +974,7 @@ async function main() {
 
                     const messages = response.data.messages || [];
                     const results = await Promise.all(
-                        messages.map(async (msg) => {
+                        messages.map(async (msg: any) => {
                             const detail = await gmail.users.messages.get({
                                 userId: 'me',
                                 id: msg.id!,
@@ -582,9 +984,9 @@ async function main() {
                             const headers = detail.data.payload?.headers || [];
                             return {
                                 id: msg.id,
-                                subject: headers.find(h => h.name === 'Subject')?.value || '',
-                                from: headers.find(h => h.name === 'From')?.value || '',
-                                date: headers.find(h => h.name === 'Date')?.value || '',
+                                subject: headers.find((h: any) => h.name === 'Subject')?.value || '',
+                                from: headers.find((h: any) => h.name === 'From')?.value || '',
+                                date: headers.find((h: any) => h.name === 'Date')?.value || '',
                             };
                         })
                     );
@@ -1311,14 +1713,14 @@ async function main() {
                     const threadMessages = threadResponse.data.messages || [];
 
                     // Process each message in the thread (already chronological from API)
-                    const messagesOutput = threadMessages.map((msg) => {
+                    const messagesOutput = threadMessages.map((msg: any) => {
                         const headers = msg.payload?.headers || [];
-                        const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
-                        const from = headers.find(h => h.name?.toLowerCase() === 'from')?.value || '';
-                        const to = headers.find(h => h.name?.toLowerCase() === 'to')?.value || '';
-                        const cc = headers.find(h => h.name?.toLowerCase() === 'cc')?.value || '';
-                        const bcc = headers.find(h => h.name?.toLowerCase() === 'bcc')?.value || '';
-                        const date = headers.find(h => h.name?.toLowerCase() === 'date')?.value || '';
+                        const subject = headers.find((h: any) => h.name?.toLowerCase() === 'subject')?.value || '';
+                        const from = headers.find((h: any) => h.name?.toLowerCase() === 'from')?.value || '';
+                        const to = headers.find((h: any) => h.name?.toLowerCase() === 'to')?.value || '';
+                        const cc = headers.find((h: any) => h.name?.toLowerCase() === 'cc')?.value || '';
+                        const bcc = headers.find((h: any) => h.name?.toLowerCase() === 'bcc')?.value || '';
+                        const date = headers.find((h: any) => h.name?.toLowerCase() === 'date')?.value || '';
 
                         // Extract body content
                         let body = '';
@@ -1392,7 +1794,7 @@ async function main() {
 
                     // Fetch metadata for each thread to get message count and latest message info
                     const threadDetails = await Promise.all(
-                        threads.map(async (thread) => {
+                        threads.map(async (thread: any) => {
                             const detail = await gmail.users.threads.get({
                                 userId: 'me',
                                 id: thread.id!,
@@ -1410,9 +1812,9 @@ async function main() {
                                 historyId: thread.historyId || '',
                                 messageCount: messages.length,
                                 latestMessage: {
-                                    from: latestHeaders.find(h => h.name === 'From')?.value || '',
-                                    subject: latestHeaders.find(h => h.name === 'Subject')?.value || '',
-                                    date: latestHeaders.find(h => h.name === 'Date')?.value || '',
+                                    from: latestHeaders.find((h: any) => h.name === 'From')?.value || '',
+                                    subject: latestHeaders.find((h: any) => h.name === 'Subject')?.value || '',
+                                    date: latestHeaders.find((h: any) => h.name === 'Date')?.value || '',
                                 },
                             };
                         })
@@ -1444,7 +1846,7 @@ async function main() {
                     if (!validatedArgs.expandThreads) {
                         // Return basic thread list without expansion (same as list_inbox_threads)
                         const threadSummaries = await Promise.all(
-                            threads.map(async (thread) => {
+                            threads.map(async (thread: any) => {
                                 const detail = await gmail.users.threads.get({
                                     userId: 'me',
                                     id: thread.id!,
@@ -1462,9 +1864,9 @@ async function main() {
                                     historyId: thread.historyId || '',
                                     messageCount: messages.length,
                                     latestMessage: {
-                                        from: latestHeaders.find(h => h.name === 'From')?.value || '',
-                                        subject: latestHeaders.find(h => h.name === 'Subject')?.value || '',
-                                        date: latestHeaders.find(h => h.name === 'Date')?.value || '',
+                                        from: latestHeaders.find((h: any) => h.name === 'From')?.value || '',
+                                        subject: latestHeaders.find((h: any) => h.name === 'Subject')?.value || '',
+                                        date: latestHeaders.find((h: any) => h.name === 'Date')?.value || '',
                                     },
                                 };
                             })
@@ -1485,7 +1887,7 @@ async function main() {
 
                     // Expand each thread with full message content (parallel fetch)
                     const expandedThreads = await Promise.all(
-                        threads.map(async (thread) => {
+                        threads.map(async (thread: any) => {
                             const threadDetail = await gmail.users.threads.get({
                                 userId: 'me',
                                 id: thread.id!,
@@ -1494,14 +1896,14 @@ async function main() {
 
                             const threadMessages = threadDetail.data.messages || [];
 
-                            const messages = threadMessages.map((msg) => {
+                            const messages = threadMessages.map((msg: any) => {
                                 const headers = msg.payload?.headers || [];
-                                const subject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
-                                const from = headers.find(h => h.name?.toLowerCase() === 'from')?.value || '';
-                                const to = headers.find(h => h.name?.toLowerCase() === 'to')?.value || '';
-                                const cc = headers.find(h => h.name?.toLowerCase() === 'cc')?.value || '';
-                                const bcc = headers.find(h => h.name?.toLowerCase() === 'bcc')?.value || '';
-                                const date = headers.find(h => h.name?.toLowerCase() === 'date')?.value || '';
+                                const subject = headers.find((h: any) => h.name?.toLowerCase() === 'subject')?.value || '';
+                                const from = headers.find((h: any) => h.name?.toLowerCase() === 'from')?.value || '';
+                                const to = headers.find((h: any) => h.name?.toLowerCase() === 'to')?.value || '';
+                                const cc = headers.find((h: any) => h.name?.toLowerCase() === 'cc')?.value || '';
+                                const bcc = headers.find((h: any) => h.name?.toLowerCase() === 'bcc')?.value || '';
+                                const date = headers.find((h: any) => h.name?.toLowerCase() === 'date')?.value || '';
 
                                 const { text, html } = extractEmailContent(msg.payload as GmailMessagePart || {});
                                 const body = text || html || '';
@@ -1580,12 +1982,12 @@ async function main() {
                     const threadId = originalEmail.data.threadId || '';
 
                     // Extract relevant headers
-                    const originalFrom = headers.find(h => h.name?.toLowerCase() === 'from')?.value || '';
-                    const originalTo = headers.find(h => h.name?.toLowerCase() === 'to')?.value || '';
-                    const originalCc = headers.find(h => h.name?.toLowerCase() === 'cc')?.value || '';
-                    const originalSubject = headers.find(h => h.name?.toLowerCase() === 'subject')?.value || '';
-                    const originalMessageId = headers.find(h => h.name?.toLowerCase() === 'message-id')?.value || '';
-                    const originalReferences = headers.find(h => h.name?.toLowerCase() === 'references')?.value || '';
+                    const originalFrom = headers.find((h: any) => h.name?.toLowerCase() === 'from')?.value || '';
+                    const originalTo = headers.find((h: any) => h.name?.toLowerCase() === 'to')?.value || '';
+                    const originalCc = headers.find((h: any) => h.name?.toLowerCase() === 'cc')?.value || '';
+                    const originalSubject = headers.find((h: any) => h.name?.toLowerCase() === 'subject')?.value || '';
+                    const originalMessageId = headers.find((h: any) => h.name?.toLowerCase() === 'message-id')?.value || '';
+                    const originalReferences = headers.find((h: any) => h.name?.toLowerCase() === 'references')?.value || '';
 
                     // Get authenticated user's email to exclude from recipients
                     const profile = await gmail.users.getProfile({ userId: 'me' });
@@ -1681,8 +2083,74 @@ async function main() {
         }
     });
 
-    const transport = new StdioServerTransport();
-    server.connect(transport);
+        return server;
+    }
+
+    if (process.argv.includes('--sse')) {
+        const portArg = process.argv.find(arg => arg.startsWith('--port='));
+        const port = portArg ? parseInt(portArg.slice('--port='.length), 10) : 8080;
+        
+        const app = express();
+        const activeTransports = new Map<string, SSEServerTransport>();
+
+        const apiKey = process.env.GMAIL_MCP_API_KEY;
+        if (apiKey) {
+            console.log("Securing SSE endpoint with GMAIL_MCP_API_KEY verification.");
+        }
+
+        const authMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+            if (apiKey) {
+                const authHeader = req.headers.authorization;
+                const token = authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : req.query.api_key;
+                if (token !== apiKey) {
+                    res.status(401).send("Unauthorized: Invalid API Key");
+                    return;
+                }
+            }
+            next();
+        };
+
+        app.get(["/sse", "/mcp"], authMiddleware, async (req, res) => {
+            console.log(`Client connecting to ${req.path}...`);
+            const endpoint = apiKey ? `/messages?api_key=${apiKey}` : "/messages";
+            const transport = new SSEServerTransport(endpoint, res);
+            
+            const sessionServer = createMcpServer();
+            
+            activeTransports.set(transport.sessionId, transport);
+            transport.onclose = async () => {
+                console.log(`SSE transport closed for session ${transport.sessionId}`);
+                activeTransports.delete(transport.sessionId);
+                try {
+                    await sessionServer.close();
+                } catch (e) {
+                    // Ignore errors during close
+                }
+            };
+
+            await sessionServer.connect(transport);
+            console.log(`SSE transport connected for session ${transport.sessionId}`);
+        });
+
+        app.post("/messages", authMiddleware, express.json(), async (req, res) => {
+            const sessionId = req.query.sessionId as string;
+            const transport = activeTransports.get(sessionId);
+            if (transport) {
+                await transport.handlePostMessage(req, res);
+            } else {
+                res.status(400).send("Invalid session ID or session has expired");
+            }
+        });
+
+        app.listen(port, () => {
+            console.log(`Gmail MCP Server successfully started in SSE mode on port ${port}`);
+            console.log(`To connect, point your client to: http://localhost:${port}/sse or http://localhost:${port}/mcp`);
+        });
+    } else {
+        const server = createMcpServer();
+        const transport = new StdioServerTransport();
+        server.connect(transport);
+    }
 }
 
 main().catch((error) => {
