@@ -3,6 +3,7 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import express from "express";
 import {
     CallToolRequestSchema,
@@ -10,6 +11,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -229,6 +231,277 @@ interface EmailContent {
 // OAuth2 configuration
 let oauth2Client: OAuth2Client;
 let authorizedScopes: string[] = DEFAULT_SCOPES;
+
+const REMOTE_MCP_SCOPE = "gmail";
+const AUTH_CODE_TTL_MS = 5 * 60 * 1000;
+const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
+const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+interface RegisteredOAuthClient {
+    clientId: string;
+    redirectUris: string[];
+    clientName?: string;
+    createdAt: number;
+}
+
+interface PendingAuthCode {
+    clientId: string;
+    redirectUri: string;
+    codeChallenge: string;
+    codeChallengeMethod: string;
+    scope: string;
+    expiresAt: number;
+}
+
+interface IssuedRemoteToken {
+    token: string;
+    scope: string;
+    expiresAt: number;
+}
+
+interface IssuedRefreshToken {
+    token: string;
+    clientId: string;
+    scope: string;
+    expiresAt: number;
+}
+
+const registeredOAuthClients = new Map<string, RegisteredOAuthClient>();
+const pendingAuthCodes = new Map<string, PendingAuthCode>();
+const issuedAccessTokens = new Map<string, IssuedRemoteToken>();
+const issuedRefreshTokens = new Map<string, IssuedRefreshToken>();
+
+function getConfiguredRemoteApiKey(): string | undefined {
+    const apiKey = process.env.GMAIL_MCP_API_KEY?.trim();
+    return apiKey || undefined;
+}
+
+function getConfiguredPublicBaseUrl(): string | undefined {
+    const raw = (process.env.GMAIL_MCP_PUBLIC_URL || process.env.MCP_PUBLIC_URL)?.trim();
+    if (!raw) return undefined;
+
+    try {
+        const url = new URL(raw);
+        url.search = "";
+        url.hash = "";
+        if (url.pathname.endsWith("/mcp")) {
+            url.pathname = url.pathname.slice(0, -"/mcp".length) || "/";
+        }
+        return url.toString().replace(/\/$/, "");
+    } catch {
+        return raw.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
+    }
+}
+
+function getRequestBaseUrl(req: express.Request): string {
+    const configured = getConfiguredPublicBaseUrl();
+    if (configured) return configured;
+
+    const forwardedProto = req.get("x-forwarded-proto")?.split(",")[0]?.trim();
+    const forwardedHost = req.get("x-forwarded-host")?.split(",")[0]?.trim();
+    const proto = forwardedProto || req.protocol || "http";
+    const host = forwardedHost || req.get("host") || "localhost";
+    return `${proto}://${host}`;
+}
+
+function getProtectedResourceMetadataUrl(req: express.Request): string {
+    return `${getRequestBaseUrl(req)}/.well-known/oauth-protected-resource/mcp`;
+}
+
+function getMcpResourceUrl(req: express.Request): string {
+    return `${getRequestBaseUrl(req)}/mcp`;
+}
+
+function oauthAuthorizationServerMetadata(req: express.Request) {
+    const baseUrl = getRequestBaseUrl(req);
+    return {
+        issuer: baseUrl,
+        authorization_endpoint: `${baseUrl}/authorize`,
+        token_endpoint: `${baseUrl}/token`,
+        registration_endpoint: `${baseUrl}/register`,
+        response_types_supported: ["code"],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        token_endpoint_auth_methods_supported: ["none"],
+        code_challenge_methods_supported: ["S256"],
+        scopes_supported: [REMOTE_MCP_SCOPE, "offline_access"],
+    };
+}
+
+function protectedResourceMetadata(req: express.Request) {
+    return {
+        resource: getMcpResourceUrl(req),
+        authorization_servers: [getRequestBaseUrl(req)],
+        bearer_methods_supported: ["header"],
+        scopes_supported: [REMOTE_MCP_SCOPE],
+    };
+}
+
+function timingSafeStringEquals(left: string, right: string): boolean {
+    const leftBuffer = Buffer.from(left);
+    const rightBuffer = Buffer.from(right);
+    if (leftBuffer.length !== rightBuffer.length) return false;
+    return timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function randomToken(): string {
+    return randomBytes(32).toString("base64url");
+}
+
+function base64Url(input: Buffer): string {
+    return input.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function pkceS256(verifier: string): string {
+    return base64Url(createHash("sha256").update(verifier).digest());
+}
+
+function cleanupRemoteAuthStores() {
+    const now = Date.now();
+    for (const [code, record] of pendingAuthCodes) {
+        if (record.expiresAt <= now) pendingAuthCodes.delete(code);
+    }
+    for (const [token, record] of issuedAccessTokens) {
+        if (record.expiresAt <= now) issuedAccessTokens.delete(token);
+    }
+    for (const [token, record] of issuedRefreshTokens) {
+        if (record.expiresAt <= now) issuedRefreshTokens.delete(token);
+    }
+}
+
+function extractBearerToken(req: express.Request): string | undefined {
+    const authHeader = req.headers.authorization;
+    if (authHeader?.startsWith("Bearer ")) {
+        return authHeader.substring("Bearer ".length).trim();
+    }
+    return undefined;
+}
+
+function queryValue(value: unknown): string | undefined {
+    return typeof value === "string" ? value : undefined;
+}
+
+function isRemoteRequestAuthorized(req: express.Request): boolean {
+    cleanupRemoteAuthStores();
+
+    const apiKey = getConfiguredRemoteApiKey();
+    const bearer = extractBearerToken(req);
+    if (bearer) {
+        if (apiKey && timingSafeStringEquals(bearer, apiKey)) {
+            return true;
+        }
+        const issued = issuedAccessTokens.get(bearer);
+        if (issued && issued.expiresAt > Date.now()) {
+            return true;
+        }
+    }
+
+    const queryApiKey = queryValue(req.query.api_key);
+    return !!(apiKey && queryApiKey && timingSafeStringEquals(queryApiKey, apiKey));
+}
+
+function sendRemoteAuthChallenge(req: express.Request, res: express.Response): void {
+    const header =
+        `Bearer error="invalid_token", ` +
+        `error_description="Authentication required", ` +
+        `resource_metadata="${getProtectedResourceMetadataUrl(req)}", ` +
+        `scope="${REMOTE_MCP_SCOPE}"`;
+
+    res
+        .status(401)
+        .set("WWW-Authenticate", header)
+        .json({
+            error: "invalid_token",
+            error_description: "Authentication required",
+        });
+}
+
+function noStore(res: express.Response): express.Response {
+    return res.set("Cache-Control", "no-store").set("Pragma", "no-cache");
+}
+
+function escapeHtml(value: string): string {
+    return value.replace(/[&<>"']/g, (char) => {
+        switch (char) {
+            case "&": return "&amp;";
+            case "<": return "&lt;";
+            case ">": return "&gt;";
+            case '"': return "&quot;";
+            case "'": return "&#39;";
+            default: return char;
+        }
+    });
+}
+
+function renderAuthorizeForm(params: Record<string, string>, error?: string): string {
+    const hiddenInputs = Object.entries(params)
+        .map(([name, value]) => `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`)
+        .join("\n");
+
+    const errorMarkup = error ? `<p class="error">${escapeHtml(error)}</p>` : "";
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize Gmail MCP</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 34rem; margin: 4rem auto; padding: 0 1rem; color: #1f2937; }
+    label { display: block; font-weight: 600; margin-bottom: 0.5rem; }
+    input[type="password"] { width: 100%; box-sizing: border-box; padding: 0.7rem; border: 1px solid #9ca3af; border-radius: 6px; }
+    button { margin-top: 1rem; padding: 0.65rem 0.9rem; border: 0; border-radius: 6px; background: #1f2937; color: white; font-weight: 600; cursor: pointer; }
+    .error { color: #b91c1c; font-weight: 600; }
+    .hint { color: #4b5563; font-size: 0.95rem; line-height: 1.45; }
+  </style>
+</head>
+<body>
+  <h1>Authorize Gmail MCP</h1>
+  <p class="hint">Enter the server API key to allow this Claude connector to use the Gmail MCP server.</p>
+  ${errorMarkup}
+  <form method="post" action="/authorize">
+    ${hiddenInputs}
+    <label for="api_key">Server API key</label>
+    <input id="api_key" name="api_key" type="password" autocomplete="current-password" required autofocus>
+    <button type="submit">Authorize</button>
+  </form>
+</body>
+</html>`;
+}
+
+function issueRemoteTokens(clientId: string, scope: string) {
+    cleanupRemoteAuthStores();
+
+    const accessToken = randomToken();
+    const refreshToken = randomToken();
+    const now = Date.now();
+
+    issuedAccessTokens.set(accessToken, {
+        token: accessToken,
+        scope,
+        expiresAt: now + ACCESS_TOKEN_TTL_MS,
+    });
+    issuedRefreshTokens.set(refreshToken, {
+        token: refreshToken,
+        clientId,
+        scope,
+        expiresAt: now + REFRESH_TOKEN_TTL_MS,
+    });
+
+    return {
+        access_token: accessToken,
+        refresh_token: refreshToken,
+        token_type: "Bearer",
+        expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
+        scope,
+    };
+}
+
+function sendOAuthError(res: express.Response, status: number, error: string, description: string): void {
+    noStore(res).status(status).json({
+        error,
+        error_description: description,
+    });
+}
 
 /**
  * Recursively extract email body content from MIME message parts
@@ -2091,28 +2364,230 @@ async function main() {
         const port = portArg ? parseInt(portArg.slice('--port='.length), 10) : 8080;
         
         const app = express();
+        app.set("trust proxy", true);
         const activeTransports = new Map<string, SSEServerTransport>();
 
         const apiKey = process.env.GMAIL_MCP_API_KEY;
         if (apiKey) {
-            console.log("Securing SSE endpoint with GMAIL_MCP_API_KEY verification.");
+            console.log("Securing remote MCP endpoints with GMAIL_MCP_API_KEY-backed OAuth.");
         }
 
-        const authMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-            if (apiKey) {
-                const authHeader = req.headers.authorization;
-                const token = authHeader?.startsWith("Bearer ") ? authHeader.substring(7) : req.query.api_key;
-                if (token !== apiKey) {
-                    res.status(401).send("Unauthorized: Invalid API Key");
-                    return;
-                }
+        const requireRemoteAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+            if (apiKey && !isRemoteRequestAuthorized(req)) {
+                sendRemoteAuthChallenge(req, res);
+                return;
             }
             next();
         };
 
-        app.get(["/sse", "/mcp"], authMiddleware, async (req, res) => {
+        const readAuthorizeParams = (source: Record<string, any>) => ({
+            response_type: queryValue(source.response_type) || "",
+            client_id: queryValue(source.client_id) || "",
+            redirect_uri: queryValue(source.redirect_uri) || "",
+            scope: queryValue(source.scope) || REMOTE_MCP_SCOPE,
+            state: queryValue(source.state) || "",
+            code_challenge: queryValue(source.code_challenge) || "",
+            code_challenge_method: queryValue(source.code_challenge_method) || "",
+        });
+
+        const validateAuthorizeParams = (params: ReturnType<typeof readAuthorizeParams>): string | undefined => {
+            if (params.response_type !== "code") {
+                return "Unsupported response_type.";
+            }
+            const client = registeredOAuthClients.get(params.client_id);
+            if (!client) {
+                return "Unknown OAuth client.";
+            }
+            if (!client.redirectUris.includes(params.redirect_uri)) {
+                return "redirect_uri is not registered for this OAuth client.";
+            }
+            try {
+                new URL(params.redirect_uri);
+            } catch {
+                return "redirect_uri must be an absolute URL.";
+            }
+            if (!params.code_challenge || params.code_challenge_method !== "S256") {
+                return "PKCE S256 is required.";
+            }
+            return undefined;
+        };
+
+        app.get("/.well-known/oauth-protected-resource", (req, res) => {
+            res.json(protectedResourceMetadata(req));
+        });
+
+        app.get("/.well-known/oauth-protected-resource/mcp", (req, res) => {
+            res.json(protectedResourceMetadata(req));
+        });
+
+        app.get(["/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"], (req, res) => {
+            res.json(oauthAuthorizationServerMetadata(req));
+        });
+
+        app.post("/register", express.json({ type: ["application/json", "application/*+json"] }), (req, res) => {
+            const redirectUris = Array.isArray(req.body?.redirect_uris)
+                ? req.body.redirect_uris.filter((uri: unknown): uri is string => typeof uri === "string")
+                : [];
+
+            if (redirectUris.length === 0) {
+                sendOAuthError(res, 400, "invalid_client_metadata", "redirect_uris must contain at least one URI.");
+                return;
+            }
+
+            const createdAt = Date.now();
+            const clientId = `client_${randomUUID()}`;
+            const client: RegisteredOAuthClient = {
+                clientId,
+                redirectUris,
+                clientName: typeof req.body?.client_name === "string" ? req.body.client_name : undefined,
+                createdAt,
+            };
+            registeredOAuthClients.set(clientId, client);
+
+            noStore(res).status(201).json({
+                client_id: clientId,
+                client_id_issued_at: Math.floor(createdAt / 1000),
+                redirect_uris: redirectUris,
+                grant_types: ["authorization_code", "refresh_token"],
+                response_types: ["code"],
+                token_endpoint_auth_method: "none",
+            });
+        });
+
+        app.get("/authorize", (req, res) => {
+            const params = readAuthorizeParams(req.query as Record<string, any>);
+            const validationError = validateAuthorizeParams(params);
+            if (validationError) {
+                res.status(400).send(validationError);
+                return;
+            }
+            res.type("html").send(renderAuthorizeForm(params));
+        });
+
+        app.post("/authorize", express.urlencoded({ extended: false }), (req, res) => {
+            const params = readAuthorizeParams(req.body as Record<string, any>);
+            const validationError = validateAuthorizeParams(params);
+            if (validationError) {
+                res.status(400).send(validationError);
+                return;
+            }
+
+            const configuredKey = getConfiguredRemoteApiKey();
+            const submittedKey = typeof req.body?.api_key === "string" ? req.body.api_key : "";
+            if (!configuredKey || !submittedKey || !timingSafeStringEquals(submittedKey, configuredKey)) {
+                res.status(401).type("html").send(renderAuthorizeForm(params, "Invalid API key."));
+                return;
+            }
+
+            const code = randomToken();
+            pendingAuthCodes.set(code, {
+                clientId: params.client_id,
+                redirectUri: params.redirect_uri,
+                codeChallenge: params.code_challenge,
+                codeChallengeMethod: params.code_challenge_method,
+                scope: REMOTE_MCP_SCOPE,
+                expiresAt: Date.now() + AUTH_CODE_TTL_MS,
+            });
+
+            const redirectUrl = new URL(params.redirect_uri);
+            redirectUrl.searchParams.set("code", code);
+            if (params.state) {
+                redirectUrl.searchParams.set("state", params.state);
+            }
+            res.redirect(302, redirectUrl.toString());
+        });
+
+        app.post("/token", express.urlencoded({ extended: false }), (req, res) => {
+            cleanupRemoteAuthStores();
+
+            const grantType = req.body?.grant_type;
+            if (grantType === "authorization_code") {
+                const codeValue = typeof req.body?.code === "string" ? req.body.code : "";
+                const code = pendingAuthCodes.get(codeValue);
+                if (!code || code.expiresAt <= Date.now()) {
+                    sendOAuthError(res, 400, "invalid_grant", "Authorization code is invalid or expired.");
+                    return;
+                }
+
+                const clientId = typeof req.body?.client_id === "string" ? req.body.client_id : "";
+                const redirectUri = typeof req.body?.redirect_uri === "string" ? req.body.redirect_uri : "";
+                const codeVerifier = typeof req.body?.code_verifier === "string" ? req.body.code_verifier : "";
+
+                if (clientId !== code.clientId || redirectUri !== code.redirectUri) {
+                    sendOAuthError(res, 400, "invalid_grant", "Authorization code client or redirect_uri mismatch.");
+                    return;
+                }
+                if (!codeVerifier || pkceS256(codeVerifier) !== code.codeChallenge) {
+                    sendOAuthError(res, 400, "invalid_grant", "PKCE verification failed.");
+                    return;
+                }
+
+                pendingAuthCodes.delete(codeValue);
+                noStore(res).json(issueRemoteTokens(clientId, code.scope));
+                return;
+            }
+
+            if (grantType === "refresh_token") {
+                const refreshTokenValue = typeof req.body?.refresh_token === "string" ? req.body.refresh_token : "";
+                const refreshToken = issuedRefreshTokens.get(refreshTokenValue);
+                if (!refreshToken || refreshToken.expiresAt <= Date.now()) {
+                    sendOAuthError(res, 400, "invalid_grant", "Refresh token is invalid or expired.");
+                    return;
+                }
+
+                const clientId = typeof req.body?.client_id === "string" ? req.body.client_id : "";
+                if (clientId && clientId !== refreshToken.clientId) {
+                    sendOAuthError(res, 400, "invalid_grant", "Refresh token client mismatch.");
+                    return;
+                }
+
+                issuedRefreshTokens.delete(refreshTokenValue);
+                noStore(res).json(issueRemoteTokens(refreshToken.clientId, refreshToken.scope));
+                return;
+            }
+
+            sendOAuthError(res, 400, "unsupported_grant_type", "Only authorization_code and refresh_token grants are supported.");
+        });
+
+        app.all("/mcp", express.json({ type: ["application/json", "application/*+json"] }), async (req, res) => {
+            if (apiKey && !isRemoteRequestAuthorized(req)) {
+                sendRemoteAuthChallenge(req, res);
+                return;
+            }
+
+            const transport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: undefined,
+                enableJsonResponse: true,
+            });
+            const sessionServer = createMcpServer();
+
+            try {
+                await sessionServer.connect(transport);
+                await transport.handleRequest(req, res, req.body);
+            } catch (error) {
+                console.error("Streamable HTTP MCP request failed:", (error as any).message);
+                if (!res.headersSent) {
+                    res.status(500).json({
+                        jsonrpc: "2.0",
+                        error: { code: -32603, message: "Internal error" },
+                        id: null,
+                    });
+                }
+            } finally {
+                try {
+                    await sessionServer.close();
+                } catch {
+                    // Ignore errors during close
+                }
+            }
+        });
+
+        app.get("/sse", requireRemoteAuth, async (req, res) => {
             console.log(`Client connecting to ${req.path}...`);
-            const endpoint = apiKey ? `/messages?api_key=${apiKey}` : "/messages";
+            const queryApiKey = queryValue(req.query.api_key);
+            const endpoint = apiKey && queryApiKey && timingSafeStringEquals(queryApiKey, apiKey)
+                ? `/messages?api_key=${encodeURIComponent(queryApiKey)}`
+                : "/messages";
             const transport = new SSEServerTransport(endpoint, res);
             
             const sessionServer = createMcpServer();
@@ -2132,7 +2607,7 @@ async function main() {
             console.log(`SSE transport connected for session ${transport.sessionId}`);
         });
 
-        app.post("/messages", authMiddleware, express.json(), async (req, res) => {
+        app.post("/messages", requireRemoteAuth, express.json(), async (req, res) => {
             const sessionId = req.query.sessionId as string;
             const transport = activeTransports.get(sessionId);
             if (transport) {
@@ -2143,8 +2618,9 @@ async function main() {
         });
 
         app.listen(port, () => {
-            console.log(`Gmail MCP Server successfully started in SSE mode on port ${port}`);
-            console.log(`To connect, point your client to: http://localhost:${port}/sse or http://localhost:${port}/mcp`);
+            console.log(`Gmail MCP Server successfully started in remote mode on port ${port}`);
+            console.log(`Streamable HTTP endpoint: http://localhost:${port}/mcp`);
+            console.log(`Legacy SSE endpoint: http://localhost:${port}/sse`);
         });
     } else {
         const server = createMcpServer();
