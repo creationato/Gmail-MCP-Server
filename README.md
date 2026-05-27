@@ -95,7 +95,9 @@ npm run build
       - Click "Create Credentials" > "OAuth client ID"
       - Choose either "Desktop app" or "Web application" as application type
       - Give it a name and click "Create"
-      - For Web application, add `http://localhost:3000/oauth2callback` to the authorized redirect URIs
+      - For Web application, add the callback URL you will use:
+        - Local auth: `http://localhost:3000/oauth2callback`
+        - Remote MCP auth: your public URL plus `/oauth2callback`, e.g. `https://hansen-writes-byte-sticks.trycloudflare.com/oauth2callback`
       - Download the JSON file of your client's OAuth keys
       - Rename the key file to `gcp-oauth.keys.json`
 
@@ -129,7 +131,7 @@ npm run build
    > **Note**: 
    > - After successful authentication, credentials are stored globally in `~/.gmail-mcp/` and can be used from any directory
    > - Both Desktop app and Web application credentials are supported
-   > - For Web application credentials, make sure to add `http://localhost:3000/oauth2callback` to your authorized redirect URIs
+   > - For Web application credentials, make sure every callback URL you use is listed in Google Cloud authorized redirect URIs
 
 3. Configure in Claude Desktop:
 
@@ -184,7 +186,7 @@ docker run -i --rm \
 
 ### Cloud Server Authentication
 
-For cloud server environments (like n8n), you can specify a custom callback URL during authentication:
+For cloud server environments (like n8n), you can specify a custom callback URL during CLI authentication:
 
 ```bash
 node dist/index.js auth https://gmail.gongrzhe.com/oauth2callback
@@ -206,6 +208,8 @@ node dist/index.js auth https://gmail.gongrzhe.com/oauth2callback
    ```bash
    node dist/index.js auth https://gmail.gongrzhe.com/oauth2callback
    ```
+
+For a remote MCP server used from Claude/Cowork, place a Web application OAuth JSON at `~/.gmail-mcp/gcp-oauth.keys.json`, set `GMAIL_MCP_PUBLIC_URL` or `MCP_PUBLIC_URL` to the public base URL if your proxy headers are not reliable, and add that exact public `/oauth2callback` URL in Google Cloud. Then call the `authenticate_account` MCP tool; it returns a Google authorization URL and the server handles `GET /oauth2callback` when Google redirects back.
 
 5. **Configure in your application:**
    ```json
@@ -252,10 +256,10 @@ node dist/index.js auth --scopes=gmail.readonly
 node dist/index.js auth --scopes=gmail.readonly,gmail.settings.basic
 
 # Full access (default behavior)
-node dist/index.js auth --scopes=gmail.modify,gmail.settings.basic
+node dist/index.js auth --scopes=gmail.modify,gmail.compose,gmail.send,gmail.settings.basic
 ```
 
-If no `--scopes` flag is provided, the server defaults to `gmail.modify,gmail.settings.basic` for full functionality.
+If no `--scopes` flag is provided, the server defaults to `gmail.modify,gmail.compose,gmail.send,gmail.settings.basic` for full functionality.
 
 ### Scope-to-Tool Mapping
 

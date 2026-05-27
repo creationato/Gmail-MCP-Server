@@ -27,8 +27,8 @@ export const SCOPE_REVERSE_MAP: Record<string, string> = Object.fromEntries(
   Object.entries(SCOPE_MAP).map(([short, full]) => [full, short])
 );
 
-// Default scopes (original behavior)
-export const DEFAULT_SCOPES = ["gmail.modify", "gmail.settings.basic"];
+// Default scopes for standard Gmail read/write, draft/send, and filter support.
+export const DEFAULT_SCOPES = ["gmail.modify", "gmail.compose", "gmail.send", "gmail.settings.basic"];
 
 // Convert shorthand scope name to full Google API URL
 // e.g., "gmail.readonly" -> "https://www.googleapis.com/auth/gmail.readonly"

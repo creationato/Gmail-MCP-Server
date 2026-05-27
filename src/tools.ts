@@ -256,7 +256,7 @@ export const CancelScheduledEmailSchema = z.object({
 export const AuthenticateAccountSchema = z.object({
   email: z.string().describe("The Gmail address of the account you want to authenticate/register (e.g., 'user@gmail.com')."),
   scopes: z.array(z.string()).optional().describe("Optional list of scope names to request (e.g. ['gmail.readonly', 'gmail.send']). Defaults to standard sending & management scopes if not provided.")
-}).describe("Initiates interactive OAuth authentication for a new Gmail account. Returns an authentication URL and starts a local listener.");
+}).describe("Initiates OAuth authentication for a new Gmail account. Returns an authentication URL.");
 
 // Tool definition type
 export interface ToolAnnotations {
@@ -530,7 +530,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "authenticate_account",
-    description: "Registers and authenticates a new Gmail account through Google OAuth. This opens a browser window automatically for permissions approval.",
+    description: "Registers and authenticates a new Gmail account through Google OAuth. Returns an authorization URL for the user to open.",
     schema: AuthenticateAccountSchema,
     scopes: ["gmail.readonly", "gmail.modify"],
     annotations: { title: "Authenticate Account", destructiveHint: false },

@@ -14,17 +14,26 @@ import { OAuth2Client } from 'google-auth-library';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import http from 'http';
-import open from 'open';
-import os from 'os';
 import {createEmailMessage, createEmailWithNodemailer} from "./utl.js";
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
-import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
+import { DEFAULT_SCOPES, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
 import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ScheduleEmailSchema, ListScheduledEmailsSchema, CancelScheduledEmailSchema, AuthenticateAccountSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
+import {
+    CREDENTIALS_PATH,
+    CONFIG_DIR,
+    GmailOAuthError,
+    LOCAL_GMAIL_CALLBACK_URL,
+    OAUTH_PATH,
+    authenticate,
+    completeGmailOAuthCallback,
+    createGmailOAuthClient,
+    loadOAuthKeys,
+    startLocalGmailOAuthFlow,
+    startRemoteGmailOAuthFlow,
+} from "./gmail-oauth.js";
 import {
     listAuthenticatedAccounts,
     isAccountAuthenticated,
@@ -35,25 +44,12 @@ import {
     ScheduledEmail
 } from "./db.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-
-// Configuration paths
-const CONFIG_DIR = path.join(os.homedir(), '.gmail-mcp');
-const OAUTH_PATH = process.env.GMAIL_OAUTH_PATH || path.join(CONFIG_DIR, 'gcp-oauth.keys.json');
-const CREDENTIALS_PATH = process.env.GMAIL_CREDENTIALS_PATH || path.join(CONFIG_DIR, 'credentials.json');
 
 // Dynamically resolve account credentials
 async function getAccountClient(accountEmail?: string): Promise<{ gmail: any; authorizedScopes: string[]; oauthClient: OAuth2Client }> {
     ensureDirectories();
 
-    if (!fs.existsSync(OAUTH_PATH)) {
-        throw new Error(`OAuth keys file not found at ${OAUTH_PATH}. Please place gcp-oauth.keys.json in the ~/.gmail-mcp directory.`);
-    }
-    const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
-    const keys = keysContent.installed || keysContent.web;
-    if (!keys) {
-        throw new Error('Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
-    }
+    const keys = loadOAuthKeys();
 
     let credPath = CREDENTIALS_PATH;
     let activeEmail = accountEmail;
@@ -73,11 +69,7 @@ async function getAccountClient(accountEmail?: string): Promise<{ gmail: any; au
         }
     }
 
-    const oauthClient = new OAuth2Client(
-        keys.client_id,
-        keys.client_secret,
-        "http://localhost:3000/oauth2callback"
-    );
+    const oauthClient = createGmailOAuthClient(LOCAL_GMAIL_CALLBACK_URL, keys);
 
     let scopes = DEFAULT_SCOPES;
     if (fs.existsSync(credPath)) {
@@ -468,6 +460,29 @@ function renderAuthorizeForm(params: Record<string, string>, error?: string): st
 </html>`;
 }
 
+function renderGmailOAuthResultPage(success: boolean, message: string): string {
+    const title = success ? 'Gmail authentication successful' : 'Gmail authentication failed';
+    const color = success ? '#166534' : '#b91c1c';
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 34rem; margin: 4rem auto; padding: 0 1rem; color: #1f2937; }
+    h1 { color: ${color}; }
+    p { line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h1>${escapeHtml(title)}</h1>
+  <p>${escapeHtml(message)}</p>
+</body>
+</html>`;
+}
+
 function issueRemoteTokens(clientId: string, scope: string) {
     cleanupRemoteAuthStores();
 
@@ -579,7 +594,7 @@ function extractAttachments(payload: GmailMessagePart): EmailAttachment[] {
     return attachments;
 }
 
-async function loadCredentials() {
+async function loadCredentials(callbackUrl = LOCAL_GMAIL_CALLBACK_URL) {
     try {
         // Create config directory if it doesn't exist
         if (!process.env.GMAIL_OAUTH_PATH && !process.env.GMAIL_CREDENTIALS_PATH && !fs.existsSync(CONFIG_DIR)) {
@@ -588,7 +603,6 @@ async function loadCredentials() {
 
         // Check for OAuth keys in current directory first, then in config directory
         const localOAuthPath = path.join(process.cwd(), 'gcp-oauth.keys.json');
-        let oauthPath = OAUTH_PATH;
 
         if (fs.existsSync(localOAuthPath)) {
             // If found in current directory, copy to config directory
@@ -596,32 +610,8 @@ async function loadCredentials() {
             console.log('OAuth keys found in current directory, copied to global config.');
         }
 
-        if (!fs.existsSync(OAUTH_PATH)) {
-            console.error('Error: OAuth keys file not found. Please place gcp-oauth.keys.json in current directory or', CONFIG_DIR);
-            process.exit(1);
-        }
-
-        const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
-        const keys = keysContent.installed || keysContent.web;
-
-        if (!keys) {
-            console.error('Error: Invalid OAuth keys file format. File should contain either "installed" or "web" credentials.');
-            process.exit(1);
-        }
-
-        // Parse callback URL from args (must be a URL, not a flag)
-        // Supports: node index.js auth https://example.com/callback
-        // Or: node index.js auth --scopes=gmail.readonly (uses default callback)
-        const callbackArg = process.argv.find(arg =>
-            arg.startsWith('http://') || arg.startsWith('https://')
-        );
-        const callback = callbackArg || "http://localhost:3000/oauth2callback";
-
-        oauth2Client = new OAuth2Client(
-            keys.client_id,
-            keys.client_secret,
-            callback
-        );
+        const keys = loadOAuthKeys();
+        oauth2Client = createGmailOAuthClient(callbackUrl, keys);
 
         if (fs.existsSync(CREDENTIALS_PATH)) {
             const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
@@ -642,151 +632,16 @@ async function loadCredentials() {
             }
         }
     } catch (error: any) {
-        console.error('Error loading credentials:', error);
+        console.error('Error loading credentials:', error.message || error);
         process.exit(1);
     }
 }
 
-async function authenticate(scopes: string[], accountEmail?: string) {
-    const server = http.createServer();
-    server.listen(3000, '127.0.0.1');
-
-    const scopeUrls = scopeNamesToUrls(scopes);
-
-    if (!fs.existsSync(OAUTH_PATH)) {
-        console.error('Error: OAuth keys file not found. Please place gcp-oauth.keys.json in', CONFIG_DIR);
-        process.exit(1);
-    }
-    const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf8'));
-    const keys = keysContent.installed || keysContent.web;
-    if (!keys) {
-        console.error('Error: Invalid OAuth keys file format.');
-        process.exit(1);
-    }
-
-    const tempOauthClient = new OAuth2Client(
-        keys.client_id,
-        keys.client_secret,
-        "http://localhost:3000/oauth2callback"
+function getCliCallbackUrl(): string {
+    const callbackArg = process.argv.find(arg =>
+        arg.startsWith('http://') || arg.startsWith('https://')
     );
-
-    return new Promise<void>((resolve, reject) => {
-        const authUrl = tempOauthClient.generateAuthUrl({
-            access_type: 'offline',
-            scope: scopeUrls,
-            prompt: 'consent',
-        });
-
-        console.log('Requesting scopes:', scopes.join(', '));
-        if (accountEmail) {
-            console.log(`Authenticating for account: ${accountEmail}`);
-        }
-        console.log('Please visit this URL to authenticate:', authUrl);
-        open(authUrl);
-
-        server.on('request', async (req, res) => {
-            if (!req.url?.startsWith('/oauth2callback')) return;
-
-            const url = new URL(req.url, 'http://localhost:3000');
-            const code = url.searchParams.get('code');
-
-            if (!code) {
-                res.writeHead(400);
-                res.end('No code provided');
-                reject(new Error('No code provided'));
-                return;
-            }
-
-            try {
-                const { tokens } = await tempOauthClient.getToken(code);
-                const credentials = { tokens, scopes };
-                
-                let targetCredPath = CREDENTIALS_PATH;
-                if (accountEmail) {
-                    targetCredPath = getAccountCredentialsPath(accountEmail);
-                }
-                
-                fs.writeFileSync(targetCredPath, JSON.stringify(credentials, null, 2), { mode: 0o600 });
-
-                res.writeHead(200);
-                res.end('Authentication successful! You can close this window.');
-                console.log('Credentials saved to:', targetCredPath);
-                server.close();
-                resolve();
-            } catch (error) {
-                res.writeHead(500);
-                res.end('Authentication failed');
-                reject(error);
-            }
-        });
-    });
-}
-
-function startOAuthFlow(scopes: string[], accountEmail: string): string {
-    if (!fs.existsSync(OAUTH_PATH)) {
-        throw new Error(`OAuth keys file not found at ${OAUTH_PATH}. Please place gcp-oauth.keys.json in the ~/.gmail-mcp directory.`);
-    }
-    const keysContent = JSON.parse(fs.readFileSync(OAUTH_PATH, "utf8"));
-    const keys = keysContent.installed || keysContent.web;
-    if (!keys) {
-        throw new Error("Invalid OAuth keys file format.");
-    }
-
-    const scopeUrls = scopeNamesToUrls(scopes);
-    const tempOauthClient = new OAuth2Client(
-        keys.client_id,
-        keys.client_secret,
-        "http://localhost:3000/oauth2callback"
-    );
-
-    const authUrl = tempOauthClient.generateAuthUrl({
-        access_type: "offline",
-        scope: scopeUrls,
-        prompt: "consent",
-    });
-
-    const server = http.createServer();
-    server.listen(3000, "127.0.0.1");
-
-    server.on("request", async (req, res) => {
-        if (!req.url?.startsWith("/oauth2callback")) return;
-
-        const url = new URL(req.url, "http://localhost:3000");
-        const code = url.searchParams.get("code");
-
-        if (!code) {
-            res.writeHead(400);
-            res.end("No code provided");
-            server.close();
-            return;
-        }
-
-        try {
-            const { tokens } = await tempOauthClient.getToken(code);
-            const credentials = { tokens, scopes };
-            const targetCredPath = getAccountCredentialsPath(accountEmail);
-            
-            fs.writeFileSync(targetCredPath, JSON.stringify(credentials, null, 2), { mode: 0o600 });
-
-            res.writeHead(200);
-            res.end("Authentication successful! You can close this window.");
-            console.log(`Successfully authenticated account ${accountEmail} and saved credentials.`);
-            server.close();
-        } catch (error) {
-            res.writeHead(500);
-            res.end("Authentication failed");
-            console.error("OAuth token exchange failed:", (error as any).message);
-            server.close();
-        }
-    });
-
-    setTimeout(() => {
-        server.close();
-    }, 5 * 60 * 1000);
-
-    open(authUrl);
-
-    return authUrl;
+    return callbackArg || LOCAL_GMAIL_CALLBACK_URL;
 }
 
 // Main function
@@ -820,8 +675,9 @@ async function main() {
             }
         }
         
-        await loadCredentials();
-        await authenticate(scopes, accountEmail);
+        const callbackUrl = getCliCallbackUrl();
+        await loadCredentials(callbackUrl);
+        await authenticate(scopes, accountEmail, callbackUrl);
         console.log('Authentication completed successfully');
         process.exit(0);
     }
@@ -829,8 +685,12 @@ async function main() {
     // Initialize Gmail API
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
+    interface McpServerOptions {
+        gmailOAuthPublicBaseUrl?: string;
+    }
+
     // Function to create a server instance and register all handlers
-    function createMcpServer(): Server {
+    function createMcpServer(options: McpServerOptions = {}): Server {
         const server = new Server(
             {
                 name: "gmail",
@@ -871,6 +731,53 @@ async function main() {
                     text: `Error: Tool "${name}" is not found.`,
                 }],
             };
+        }
+
+        if (name === "list_accounts") {
+            const accounts = listAuthenticatedAccounts();
+            return {
+                content: [{
+                    type: "text",
+                    text: JSON.stringify({ accounts }, null, 2),
+                }],
+            };
+        }
+
+        if (name === "authenticate_account") {
+            try {
+                const authArgs = AuthenticateAccountSchema.parse(args);
+                const scopes = authArgs.scopes || DEFAULT_SCOPES;
+
+                if (options.gmailOAuthPublicBaseUrl) {
+                    const flow = startRemoteGmailOAuthFlow({
+                        accountEmail: authArgs.email,
+                        scopes,
+                        publicBaseUrl: options.gmailOAuthPublicBaseUrl,
+                    });
+
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Google OAuth registration started for account: "${flow.accountEmail}".\n\nOpen this URL to authorize Gmail access:\n\n${flow.authUrl}\n\nAfter approval, Google will return to ${flow.redirectUri} and this server will save the credentials.`,
+                        }],
+                    };
+                }
+
+                const authUrl = startLocalGmailOAuthFlow(scopes, authArgs.email);
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Google OAuth registration started for account: "${authArgs.email}".\n\nA browser window has been opened on this machine when possible. If it did not open, visit this URL to authorize:\n\n${authUrl}\n\nOnce authorized, the credentials will be saved locally.`,
+                    }],
+                };
+            } catch (error: any) {
+                return {
+                    content: [{
+                        type: "text",
+                        text: `Error starting Gmail OAuth: ${error.message}`,
+                    }],
+                };
+            }
         }
 
         // Dynamically resolve client for requested account
@@ -1095,30 +1002,7 @@ async function main() {
 
         try {
             switch (name) {
-                // --- NEW SCHEDULING & ACCOUNT LISTING TOOLS ---
-                case "list_accounts": {
-                    const accounts = listAuthenticatedAccounts();
-                    return {
-                        content: [{
-                            type: "text",
-                            text: JSON.stringify({ accounts }, null, 2),
-                        }],
-                    };
-                }
-
-                case "authenticate_account": {
-                    const authArgs = AuthenticateAccountSchema.parse(args);
-                    const scopes = authArgs.scopes || ["gmail.modify", "gmail.compose", "gmail.send"];
-                    const authUrl = startOAuthFlow(scopes, authArgs.email);
-                    
-                    return {
-                        content: [{
-                            type: "text",
-                            text: `Successfully initiated Google OAuth registration for account: "${authArgs.email}".\n\nA web browser window has been automatically opened on your machine to authorize the requested permissions.\n\nIf the browser window did not open automatically, please click on or visit the following link to authorize:\n\n${authUrl}\n\nOnce authorized, the credentials will be securely saved locally, and you can immediately begin utilizing this account!`,
-                        }],
-                    };
-                }
-
+                // --- NEW SCHEDULING TOOLS ---
                 case "schedule_email": {
                     const scheduleArgs = ScheduleEmailSchema.parse(args);
                     const targetTime = parseScheduledTime(scheduleArgs.scheduledTime);
@@ -2497,6 +2381,39 @@ async function main() {
             res.redirect(302, redirectUrl.toString());
         });
 
+        app.get("/oauth2callback", async (req, res) => {
+            const googleError = queryValue(req.query.error);
+            if (googleError) {
+                noStore(res)
+                    .status(400)
+                    .type("html")
+                    .send(renderGmailOAuthResultPage(false, `Google OAuth failed: ${googleError}`));
+                return;
+            }
+
+            try {
+                const result = await completeGmailOAuthCallback({
+                    code: queryValue(req.query.code),
+                    state: queryValue(req.query.state),
+                });
+
+                noStore(res)
+                    .status(200)
+                    .type("html")
+                    .send(renderGmailOAuthResultPage(
+                        true,
+                        `Gmail authentication successful for ${result.accountEmail}; you can return to Claude/Cowork.`,
+                    ));
+            } catch (error) {
+                const message = error instanceof Error ? error.message : "Gmail authentication failed.";
+                const status = error instanceof GmailOAuthError ? error.statusCode : 500;
+                noStore(res)
+                    .status(status)
+                    .type("html")
+                    .send(renderGmailOAuthResultPage(false, message));
+            }
+        });
+
         app.post("/token", express.urlencoded({ extended: false }), (req, res) => {
             cleanupRemoteAuthStores();
 
@@ -2559,7 +2476,7 @@ async function main() {
                 sessionIdGenerator: undefined,
                 enableJsonResponse: true,
             });
-            const sessionServer = createMcpServer();
+            const sessionServer = createMcpServer({ gmailOAuthPublicBaseUrl: getRequestBaseUrl(req) });
 
             try {
                 await sessionServer.connect(transport);
@@ -2590,7 +2507,7 @@ async function main() {
                 : "/messages";
             const transport = new SSEServerTransport(endpoint, res);
             
-            const sessionServer = createMcpServer();
+            const sessionServer = createMcpServer({ gmailOAuthPublicBaseUrl: getRequestBaseUrl(req) });
             
             activeTransports.set(transport.sessionId, transport);
             transport.onclose = async () => {
