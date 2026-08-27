@@ -1407,6 +1407,9 @@ done
     && pass 'failed uninstall restores prior active and enabled service policy' \
     || fail 'failed uninstall restores prior active and enabled service policy'
 
+# The purge fixture models a separate host and must not inherit service state
+# from the rollback fixture above.
+find "${tmp}/fake-systemd-state" -mindepth 1 -delete
 PATH="${uninstall_bin}:${tmp}/fake-bin:${PATH}" \
 FAKE_ACCOUNT_DELETE_LOG="${tmp}/account-delete.log" \
 FAKE_SYSTEMCTL_LOG="${tmp}/uninstall-systemctl.log" \
