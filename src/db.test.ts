@@ -36,6 +36,16 @@ const {
 } = await import('./managed-files.js');
 
 const queuePath = path.join(stateDirectory, 'scheduled_queue.json');
+const PNG_BYTES = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=',
+    'base64',
+);
+const JPEG_BYTES = Buffer.from([
+    0xff, 0xd8,
+    0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00,
+    0xff, 0xda, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3f, 0x00,
+    0x00, 0xff, 0xd9,
+]);
 
 function scheduledEmail(id: string) {
     return {
@@ -58,9 +68,10 @@ function readPersistedQueue(): any {
     return JSON.parse(fs.readFileSync(queuePath, 'utf8'));
 }
 
-function writeImport(name: string, contents: string): string {
+function writeImport(name: string, contents: string | Buffer): string {
     ensureManagedFileDirectories(stateDirectory);
     const filePath = path.join(getManagedImportDirectory(stateDirectory), name);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
     fs.writeFileSync(filePath, contents, { mode: 0o600 });
     return filePath;
 }
@@ -285,6 +296,83 @@ describe('legacy queue migration', () => {
 });
 
 describe('scheduled attachment lifecycle', () => {
+    it('persists inline images only as owner-bound descriptors and restores MIME metadata', () => {
+        const source = writeImport('sources/scheduled-inline.png', PNG_BYTES);
+        writeImport('regular.txt', 'regular attachment bytes');
+        const encoded = JPEG_BYTES.toString('base64');
+        const id = 'scheduled-inline-persistence';
+
+        enqueueScheduledEmail(
+            { ...scheduledEmail(id), htmlBody: '<img src="cid:path"><img src="cid:data">' },
+            ['regular.txt'],
+            [
+                { cid: 'path', path: 'sources/scheduled-inline.png', contentType: 'image/png' },
+                {
+                    cid: 'data',
+                    content: encoded,
+                    contentType: 'image/jpeg',
+                    filename: 'decoded.jpg',
+                },
+            ],
+        );
+
+        const persisted = fs.readFileSync(queuePath, 'utf8');
+        expect(persisted).not.toContain('sources/scheduled-inline.png');
+        expect(persisted).not.toContain(encoded);
+        const queued = loadQueue()[0];
+        expect(queued.attachments).toHaveLength(3);
+        expect(queued.attachments?.map(part => part.cid)).toEqual([undefined, 'path', 'data']);
+        expect(loadScheduledAttachments(id, queued.attachments!, stateDirectory)).toEqual([
+            { filename: 'regular.txt', content: Buffer.from('regular attachment bytes') },
+            {
+                filename: 'scheduled-inline.png',
+                content: PNG_BYTES,
+                cid: 'path',
+                contentType: 'image/png',
+            },
+            {
+                filename: 'decoded.jpg',
+                content: JPEG_BYTES,
+                cid: 'data',
+                contentType: 'image/jpeg',
+            },
+        ]);
+
+        fs.unlinkSync(source);
+        expect(cancelScheduledEmail(id)).toBe(true);
+        expect(fs.readdirSync(getScheduledAttachmentsDirectory(stateDirectory))).toEqual([]);
+    });
+
+    it('detects scheduled inline-image descriptor and byte tampering', () => {
+        expect(() => enqueueScheduledEmail(
+            scheduledEmail('inline-without-html'),
+            [],
+            [{ cid: 'logo', content: 'AAAA', contentType: 'image/png' }],
+        )).toThrow(/require htmlBody/);
+        enqueueScheduledEmail(
+            {
+                ...scheduledEmail('inline-integrity'),
+                htmlBody: '<img src="cid:logo"><img src="cid:second">',
+            },
+            [],
+            [
+                { cid: 'logo', content: PNG_BYTES.toString('base64'), contentType: 'image/png' },
+                { cid: 'second', content: PNG_BYTES.toString('base64'), contentType: 'image/png' },
+            ],
+        );
+        const queued = loadQueue()[0];
+        const descriptor = queued.attachments![0];
+        const spoolPath = path.join(stateDirectory, ...descriptor.relativePath.split('/'));
+        fs.writeFileSync(spoolPath, 'tampered');
+        expect(() => loadScheduledAttachments(queued.id, queued.attachments!, stateDirectory))
+            .toThrow(/integrity/);
+
+        const crafted = structuredClone(readPersistedQueue());
+        crafted.records[0].attachments[1].cid = 'logo';
+        writeQueue(crafted);
+        expect(() => loadQueue()).toThrow(/cids must be unique/);
+    });
+
     it('spools bytes before persistence and cleans them on cancellation', () => {
         const source = writeImport('scheduled.txt', 'scheduled attachment bytes');
         enqueueScheduledEmail(scheduledEmail('cancel-with-attachment'), ['scheduled.txt']);

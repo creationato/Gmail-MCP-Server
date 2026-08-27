@@ -16,7 +16,22 @@ const COPY_BUFFER_BYTES = 64 * 1024;
 export const MAX_ATTACHMENT_COUNT = 10;
 export const MAX_ATTACHMENT_FILE_BYTES = 20 * 1024 * 1024;
 export const MAX_ATTACHMENT_AGGREGATE_BYTES = 25 * 1024 * 1024;
+export const MAX_INLINE_IMAGE_CONTENT_BYTES = 10 * 1024 * 1024;
+export const MAX_INLINE_IMAGE_AGGREGATE_BYTES = 20 * 1024 * 1024;
+export const MAX_INLINE_IMAGE_BASE64_CHARS = Math.ceil(MAX_INLINE_IMAGE_CONTENT_BYTES / 3) * 4;
 export const MAX_MANAGED_PATH_LENGTH = 1024;
+
+const INLINE_CONTENT_TYPE_VALUES = [
+    'image/png',
+    'image/jpeg',
+    'image/gif',
+    'image/webp',
+    'image/bmp',
+    'image/x-icon',
+] as const;
+type InlineContentType = typeof INLINE_CONTENT_TYPE_VALUES[number];
+const INLINE_CONTENT_TYPES = new Set<string>(INLINE_CONTENT_TYPE_VALUES);
+const INLINE_CID_PATTERN = /^[^\s<>\x00-\x1f\x7f]{1,256}$/;
 
 // Managed storage remains intentionally bounded even when callers never clean it manually.
 export const MAX_MANAGED_EXPORT_FILE_BYTES = 32 * 1024 * 1024;
@@ -26,12 +41,24 @@ export const MAX_SCHEDULED_SPOOL_BYTES = 256 * 1024 * 1024;
 export interface PreparedEmailAttachment {
     filename: string;
     content: Buffer;
+    cid?: string;
+    contentType?: string;
+}
+
+export interface InlineImageInput {
+    cid: string;
+    path?: string;
+    content?: string;
+    contentType?: string;
+    filename?: string;
 }
 
 export interface ScheduledAttachmentMetadata {
     filename: string;
     size: number;
     sha256: string;
+    cid?: string;
+    contentType?: string;
 }
 
 export interface ScheduledAttachment extends ScheduledAttachmentMetadata {
@@ -414,6 +441,327 @@ export function loadManagedAttachments(
     }));
 }
 
+function validateInlineCid(value: unknown): string {
+    if (typeof value !== 'string' || !INLINE_CID_PATTERN.test(value)) {
+        throw new Error('Inline image cid must contain 1-256 safe non-whitespace characters.');
+    }
+    return value;
+}
+
+function validateInlineContentType(value: unknown, required: boolean): string | undefined {
+    if (value === undefined && !required) return undefined;
+    if (typeof value !== 'string' || !INLINE_CONTENT_TYPES.has(value)) {
+        throw new Error('Inline image contentType is missing or unsupported.');
+    }
+    return value;
+}
+
+function hasBytes(content: Buffer, offset: number, expected: readonly number[]): boolean {
+    if (offset < 0 || offset + expected.length > content.length) return false;
+    return expected.every((value, index) => content[offset + index] === value);
+}
+
+function isPng(content: Buffer): boolean {
+    if (!hasBytes(content, 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return false;
+    let offset = 8;
+    let sawHeader = false;
+    let sawImageData = false;
+    while (offset + 12 <= content.length) {
+        const length = content.readUInt32BE(offset);
+        if (length > content.length - offset - 12) return false;
+        const type = content.toString('ascii', offset + 4, offset + 8);
+        const chunkEnd = offset + 12 + length;
+        if (!sawHeader) {
+            if (type !== 'IHDR' || length !== 13) return false;
+            if (content.readUInt32BE(offset + 8) === 0 || content.readUInt32BE(offset + 12) === 0) {
+                return false;
+            }
+            sawHeader = true;
+        } else if (type === 'IHDR') {
+            return false;
+        }
+        if (type === 'IDAT') sawImageData = true;
+        if (type === 'IEND') {
+            return length === 0 && sawImageData && chunkEnd === content.length;
+        }
+        offset = chunkEnd;
+    }
+    return false;
+}
+
+function isJpegStartOfFrame(marker: number): boolean {
+    return marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+}
+
+function isJpeg(content: Buffer): boolean {
+    if (
+        content.length < 14 || !hasBytes(content, 0, [0xff, 0xd8]) ||
+        !hasBytes(content, content.length - 2, [0xff, 0xd9])
+    ) return false;
+    let offset = 2;
+    let sawFrame = false;
+    while (offset < content.length - 2) {
+        if (content[offset] !== 0xff) return false;
+        while (offset < content.length && content[offset] === 0xff) offset += 1;
+        if (offset >= content.length) return false;
+        const marker = content[offset++];
+        if (marker === 0x00 || marker === 0xd8 || marker === 0xd9) return false;
+        if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+        if (offset + 2 > content.length) return false;
+        const segmentLength = content.readUInt16BE(offset);
+        if (segmentLength < 2 || segmentLength > content.length - offset) return false;
+        if (isJpegStartOfFrame(marker)) {
+            if (segmentLength < 8 || offset + 8 > content.length) return false;
+            const componentCount = content[offset + 7];
+            if (
+                componentCount === 0 || segmentLength !== 8 + (3 * componentCount) ||
+                content.readUInt16BE(offset + 3) === 0 || content.readUInt16BE(offset + 5) === 0
+            ) return false;
+            sawFrame = true;
+        }
+        if (marker === 0xda) {
+            return sawFrame && segmentLength >= 6 && offset + segmentLength <= content.length - 2;
+        }
+        offset += segmentLength;
+    }
+    return false;
+}
+
+function isGif(content: Buffer): boolean {
+    if (content.length < 14 || content[content.length - 1] !== 0x3b) return false;
+    const version = content.toString('ascii', 0, 6);
+    if (version !== 'GIF87a' && version !== 'GIF89a') return false;
+    if (content.readUInt16LE(6) === 0 || content.readUInt16LE(8) === 0) return false;
+    const globalColorTableBytes = (content[10] & 0x80) === 0
+        ? 0
+        : 3 * (2 ** ((content[10] & 0x07) + 1));
+    return 13 + globalColorTableBytes < content.length;
+}
+
+function isWebp(content: Buffer): boolean {
+    if (
+        content.length < 25 || content.toString('ascii', 0, 4) !== 'RIFF' ||
+        content.toString('ascii', 8, 12) !== 'WEBP' || content.readUInt32LE(4) + 8 !== content.length
+    ) return false;
+    const chunkType = content.toString('ascii', 12, 16);
+    const chunkLength = content.readUInt32LE(16);
+    if (chunkLength > content.length - 20) return false;
+    if (chunkType === 'VP8 ') {
+        return chunkLength >= 10 && content.length >= 30 && hasBytes(content, 23, [0x9d, 0x01, 0x2a]) &&
+            (content.readUInt16LE(26) & 0x3fff) > 0 && (content.readUInt16LE(28) & 0x3fff) > 0;
+    }
+    if (chunkType === 'VP8L') {
+        if (chunkLength < 5 || content[20] !== 0x2f) return false;
+        const dimensions = content.readUInt32LE(21);
+        return (dimensions & 0x3fff) + 1 > 0 && ((dimensions >>> 14) & 0x3fff) + 1 > 0;
+    }
+    if (chunkType === 'VP8X') {
+        return chunkLength >= 10 && content.length >= 30 && content.readUIntLE(24, 3) + 1 > 0 &&
+            content.readUIntLE(27, 3) + 1 > 0;
+    }
+    return false;
+}
+
+function isBmp(content: Buffer): boolean {
+    if (content.length < 26 || content.toString('ascii', 0, 2) !== 'BM') return false;
+    if (content.readUInt32LE(2) !== content.length) return false;
+    const pixelOffset = content.readUInt32LE(10);
+    const dibSize = content.readUInt32LE(14);
+    if (pixelOffset < 14 + dibSize || pixelOffset > content.length) return false;
+    if (dibSize === 12) {
+        return content.readUInt16LE(18) > 0 && content.readUInt16LE(20) > 0;
+    }
+    return dibSize >= 40 && content.readInt32LE(18) > 0 && content.readInt32LE(22) !== 0;
+}
+
+function isIco(content: Buffer): boolean {
+    if (content.length < 22 || !hasBytes(content, 0, [0x00, 0x00, 0x01, 0x00])) return false;
+    const imageCount = content.readUInt16LE(4);
+    const directoryEnd = 6 + (16 * imageCount);
+    if (imageCount === 0 || directoryEnd > content.length) return false;
+    for (let index = 0; index < imageCount; index += 1) {
+        const entryOffset = 6 + (16 * index);
+        const imageSize = content.readUInt32LE(entryOffset + 8);
+        const imageOffset = content.readUInt32LE(entryOffset + 12);
+        if (
+            imageSize === 0 || imageOffset < directoryEnd || imageOffset > content.length ||
+            imageSize > content.length - imageOffset
+        ) return false;
+        const image = content.subarray(imageOffset, imageOffset + imageSize);
+        const dibSize = image.length >= 4 ? image.readUInt32LE(0) : 0;
+        if (!isPng(image) && ![12, 40, 64, 108, 124].includes(dibSize)) return false;
+    }
+    return true;
+}
+
+export function detectInlineImageContentType(content: Buffer): InlineContentType | undefined {
+    if (isPng(content)) return 'image/png';
+    if (isJpeg(content)) return 'image/jpeg';
+    if (isGif(content)) return 'image/gif';
+    if (isWebp(content)) return 'image/webp';
+    if (isBmp(content)) return 'image/bmp';
+    if (isIco(content)) return 'image/x-icon';
+    return undefined;
+}
+
+function verifiedInlineContentType(
+    content: Buffer,
+    suppliedContentType: string | undefined,
+    cid: string,
+): InlineContentType {
+    const detectedContentType = detectInlineImageContentType(content);
+    if (!detectedContentType) {
+        throw new Error(`Inline image '${cid}' is not a supported, well-formed bitmap image.`);
+    }
+    if (suppliedContentType !== undefined && suppliedContentType !== detectedContentType) {
+        throw new Error(
+            `Inline image '${cid}' contentType ${suppliedContentType} does not match detected ${detectedContentType}.`,
+        );
+    }
+    return detectedContentType;
+}
+
+export function hasCanonicalBase64Syntax(value: string): boolean {
+    if (value.length === 0 || value.length % 4 !== 0) return false;
+    let padding = 0;
+    if (value.endsWith('==')) padding = 2;
+    else if (value.endsWith('=')) padding = 1;
+    const dataLength = value.length - padding;
+    for (let index = 0; index < dataLength; index += 1) {
+        const code = value.charCodeAt(index);
+        if (!(
+            (code >= 65 && code <= 90) ||
+            (code >= 97 && code <= 122) ||
+            (code >= 48 && code <= 57) ||
+            code === 43 ||
+            code === 47
+        )) return false;
+    }
+    for (let index = dataLength; index < value.length; index += 1) {
+        if (value.charCodeAt(index) !== 61) return false;
+    }
+    if (padding > 0) {
+        const code = value.charCodeAt(dataLength - 1);
+        const sextet = code >= 65 && code <= 90 ? code - 65
+            : code >= 97 && code <= 122 ? code - 71
+                : code >= 48 && code <= 57 ? code + 4
+                    : code === 43 ? 62 : 63;
+        if ((padding === 2 && (sextet & 0x0f) !== 0) ||
+            (padding === 1 && (sextet & 0x03) !== 0)) return false;
+    }
+    return true;
+}
+
+function decodeCanonicalBase64(value: unknown, cid: string): Buffer {
+    if (typeof value !== 'string' || value.length === 0) {
+        throw new Error(`Inline image '${cid}' content must be non-empty canonical base64.`);
+    }
+    if (value.length > MAX_INLINE_IMAGE_BASE64_CHARS) {
+        throw new Error(`Inline image '${cid}' exceeds the ${MAX_INLINE_IMAGE_CONTENT_BYTES}-byte limit.`);
+    }
+    if (!hasCanonicalBase64Syntax(value)) {
+        throw new Error(`Inline image '${cid}' content must be canonical base64.`);
+    }
+    const decoded = Buffer.from(value, 'base64');
+    if (decoded.length > MAX_INLINE_IMAGE_CONTENT_BYTES || decoded.toString('base64') !== value) {
+        throw new Error(`Inline image '${cid}' content must be canonical base64 within the size limit.`);
+    }
+    return decoded;
+}
+
+function inlineFilename(value: unknown, fallback: string): string {
+    if (value !== undefined && typeof value !== 'string') {
+        throw new Error('Inline image filename must be a string.');
+    }
+    return cleanDisplayFilename(value ?? fallback, 'inline-image');
+}
+
+export function prepareEmailMimeParts(
+    attachmentPaths: string[] = [],
+    inlineImages: InlineImageInput[] = [],
+    stateDirectory = getStateDirectory(),
+): PreparedEmailAttachment[] {
+    if (!Array.isArray(attachmentPaths) || !Array.isArray(inlineImages)) {
+        throw new Error('Attachments and inlineImages must be arrays.');
+    }
+    if (attachmentPaths.length + inlineImages.length > MAX_ATTACHMENT_COUNT) {
+        throw new Error(`At most ${MAX_ATTACHMENT_COUNT} total attachments and inline images are allowed.`);
+    }
+
+    const attachmentSnapshots = inspectAttachmentSet(attachmentPaths, stateDirectory);
+    const inlineCids = new Set<string>();
+    const preparedInline: Array<{
+        snapshot?: AttachmentSnapshot;
+        content?: Buffer;
+        filename: string;
+        cid: string;
+        suppliedContentType?: string;
+    }> = [];
+    let base64Bytes = 0;
+
+    for (const image of inlineImages) {
+        if (!image || typeof image !== 'object') throw new Error('Inline image must be an object.');
+        const cid = validateInlineCid(image.cid);
+        if (inlineCids.has(cid)) throw new Error(`Duplicate inline image cid '${cid}' is not allowed.`);
+        inlineCids.add(cid);
+        const hasPath = typeof image.path === 'string' && image.path.length > 0;
+        const hasContent = typeof image.content === 'string' && image.content.length > 0;
+        if (hasPath === hasContent) {
+            throw new Error(`Inline image '${cid}' must set exactly one of path or content.`);
+        }
+        if (hasPath) {
+            const [snapshot] = inspectAttachmentSet([image.path!], stateDirectory);
+            preparedInline.push({
+                snapshot,
+                filename: inlineFilename(image.filename, snapshot.filename),
+                cid,
+                suppliedContentType: validateInlineContentType(image.contentType, false),
+            });
+        } else {
+            const content = decodeCanonicalBase64(image.content, cid);
+            base64Bytes += content.length;
+            if (base64Bytes > MAX_INLINE_IMAGE_AGGREGATE_BYTES) {
+                throw new Error(
+                    `Decoded inline image content exceeds the ${MAX_INLINE_IMAGE_AGGREGATE_BYTES}-byte aggregate limit.`,
+                );
+            }
+            preparedInline.push({
+                content,
+                filename: inlineFilename(image.filename, cid),
+                cid,
+                suppliedContentType: validateInlineContentType(image.contentType, true),
+            });
+        }
+    }
+
+    const totalBytes = attachmentSnapshots.reduce((total, item) => total + item.size, 0) +
+        preparedInline.reduce(
+            (total, item) => total + (item.snapshot?.size ?? item.content?.length ?? 0),
+            0,
+        );
+    if (totalBytes > MAX_ATTACHMENT_AGGREGATE_BYTES) {
+        throw new Error(
+            `Aggregate attachments and inline images exceed the ${MAX_ATTACHMENT_AGGREGATE_BYTES}-byte limit.`,
+        );
+    }
+
+    return [
+        ...attachmentSnapshots.map(snapshot => ({
+            filename: snapshot.filename,
+            content: readSnapshot(snapshot),
+        })),
+        ...preparedInline.map(item => {
+            const content = item.content ?? readSnapshot(item.snapshot!);
+            return {
+                filename: item.filename,
+                content,
+                cid: item.cid,
+                contentType: verifiedInlineContentType(content, item.suppliedContentType, item.cid),
+            };
+        }),
+    ];
+}
+
 function resolveExportDirectory(savePath: string | undefined, stateDirectory: string): string {
     const roots = ensureManagedRoots(stateDirectory);
     if (!savePath || savePath.trim() === '' || savePath === '.') return roots.exportsDirectory;
@@ -585,51 +933,10 @@ function validateScheduleId(scheduleId: string): void {
 
 function writeAll(descriptor: number, buffer: Buffer, length: number): void {
     let offset = 0;
-    while (offset < length) offset += fs.writeSync(descriptor, buffer, offset, length - offset);
-}
-
-function copySnapshotToSpool(
-    snapshot: AttachmentSnapshot,
-    spoolRoot: string,
-    filePath: string,
-): { size: number; sha256: string } {
-    const source = openResolvedAttachment(snapshot, snapshot);
-    let destination: number | undefined;
-    try {
-        destination = fs.openSync(
-            filePath,
-            fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
-                (fs.constants.O_NOFOLLOW ?? 0),
-            0o600,
-        );
-        assertOpenedDescriptorWithin(spoolRoot, destination, 'Opened scheduled attachment');
-        if (fs.fstatSync(destination).nlink !== 1) {
-            throw new Error('Scheduled spool files must not be multiply linked.');
-        }
-        const hash = createHash('sha256');
-        const buffer = Buffer.alloc(COPY_BUFFER_BYTES);
-        let copied = 0;
-        while (true) {
-            const read = fs.readSync(source.descriptor, buffer, 0, buffer.length, null);
-            if (read === 0) break;
-            copied += read;
-            if (copied > snapshot.size || copied > MAX_ATTACHMENT_FILE_BYTES) {
-                throw new Error('Managed attachment changed while it was being copied.');
-            }
-            hash.update(buffer.subarray(0, read));
-            writeAll(destination, buffer, read);
-        }
-        assertStableSnapshot(source.stats, fs.fstatSync(source.descriptor));
-        if (copied !== snapshot.size) throw new Error('Managed attachment changed while it was being copied.');
-        fs.fsyncSync(destination);
-        const destinationStats = fs.fstatSync(destination);
-        if (destinationStats.nlink !== 1 || destinationStats.size !== copied) {
-            throw new Error('Scheduled spool file changed while it was being written.');
-        }
-        return { size: copied, sha256: hash.digest('hex') };
-    } finally {
-        fs.closeSync(source.descriptor);
-        if (destination !== undefined) fs.closeSync(destination);
+    while (offset < length) {
+        const written = fs.writeSync(descriptor, buffer, offset, length - offset);
+        if (written <= 0) throw new Error('Scheduled spool write made no progress.');
+        offset += written;
     }
 }
 
@@ -637,13 +944,14 @@ export function spoolScheduledAttachments(
     scheduleId: string,
     inputPaths: string[],
     stateDirectory = getStateDirectory(),
+    inlineImages: InlineImageInput[] = [],
 ): ScheduledAttachment[] {
     return withStateLockSync(() => {
         validateScheduleId(scheduleId);
         if (!Array.isArray(inputPaths)) throw new Error('Scheduled attachment paths must be an array.');
-        if (inputPaths.length === 0) return [];
-        const snapshots = inspectAttachmentSet(inputPaths, stateDirectory);
-        const aggregateBytes = snapshots.reduce((total, attachment) => total + attachment.size, 0);
+        if (inputPaths.length === 0 && inlineImages.length === 0) return [];
+        const parts = prepareEmailMimeParts(inputPaths, inlineImages, stateDirectory);
+        const aggregateBytes = parts.reduce((total, part) => total + part.content.length, 0);
         const roots = ensureManagedRoots(stateDirectory);
         const currentUsage = directoryRegularFileBytes(roots.scheduledAttachmentsDirectory);
         if (currentUsage + aggregateBytes > MAX_SCHEDULED_SPOOL_BYTES) {
@@ -655,13 +963,32 @@ export function spoolScheduledAttachments(
         fs.mkdirSync(stagingDirectory, { mode: 0o700 });
         let committed = false;
         try {
-            const attachments = snapshots.map((snapshot, index) => {
+            const attachments = parts.map((part, index) => {
                 const spoolFilename = `${String(index).padStart(4, '0')}-${randomUUID()}.bin`;
-                const copied = copySnapshotToSpool(
-                    snapshot,
-                    roots.scheduledAttachmentsDirectory,
+                const destination = fs.openSync(
                     path.join(stagingDirectory, spoolFilename),
+                    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
+                        (fs.constants.O_NOFOLLOW ?? 0),
+                    0o600,
                 );
+                try {
+                    assertOpenedDescriptorWithin(
+                        roots.scheduledAttachmentsDirectory,
+                        destination,
+                        'Opened scheduled attachment',
+                    );
+                    if (fs.fstatSync(destination).nlink !== 1) {
+                        throw new Error('Scheduled spool files must not be multiply linked.');
+                    }
+                    writeAll(destination, part.content, part.content.length);
+                    fs.fsyncSync(destination);
+                    const finalStats = fs.fstatSync(destination);
+                    if (finalStats.nlink !== 1 || finalStats.size !== part.content.length) {
+                        throw new Error('Scheduled spool file changed while it was being written.');
+                    }
+                } finally {
+                    fs.closeSync(destination);
+                }
                 return {
                     ownerId: scheduleId,
                     bundleId,
@@ -670,9 +997,11 @@ export function spoolScheduledAttachments(
                         bundleId,
                         spoolFilename,
                     ),
-                    filename: snapshot.filename,
-                    size: copied.size,
-                    sha256: copied.sha256,
+                    filename: part.filename,
+                    size: part.content.length,
+                    sha256: createHash('sha256').update(part.content).digest('hex'),
+                    ...(part.cid ? { cid: part.cid } : {}),
+                    ...(part.contentType ? { contentType: part.contentType } : {}),
                 };
             });
             syncDirectory(stagingDirectory);
@@ -694,10 +1023,19 @@ export function isScheduledAttachment(value: unknown): value is ScheduledAttachm
         typeof candidate.ownerId === 'string' && SCHEDULE_ID_PATTERN.test(candidate.ownerId) &&
         typeof candidate.bundleId === 'string' && candidate.bundleId.startsWith(`${candidate.ownerId}-`) &&
         typeof candidate.relativePath === 'string' && candidate.relativePath.length <= MAX_MANAGED_PATH_LENGTH &&
-        typeof candidate.filename === 'string' && candidate.filename.length > 0 && candidate.filename.length <= 240 &&
+        typeof candidate.filename === 'string' && candidate.filename.length > 0 &&
+        candidate.filename.length <= 240 && candidate.filename !== '.' && candidate.filename !== '..' &&
+        !/[\\/\x00-\x1f\x7f]/.test(candidate.filename) &&
         Number.isSafeInteger(candidate.size) && (candidate.size ?? -1) >= 0 &&
         (candidate.size ?? MAX_ATTACHMENT_FILE_BYTES + 1) <= MAX_ATTACHMENT_FILE_BYTES &&
-        typeof candidate.sha256 === 'string' && SHA256_PATTERN.test(candidate.sha256)
+        typeof candidate.sha256 === 'string' && SHA256_PATTERN.test(candidate.sha256) &&
+        (candidate.cid === undefined || (
+            typeof candidate.cid === 'string' && INLINE_CID_PATTERN.test(candidate.cid)
+        )) &&
+        (candidate.contentType === undefined || (
+            typeof candidate.contentType === 'string' && INLINE_CONTENT_TYPES.has(candidate.contentType)
+        )) &&
+        (candidate.cid !== undefined || candidate.contentType === undefined)
     );
 }
 
@@ -705,7 +1043,13 @@ export function toScheduledAttachmentMetadata(
     attachments: ScheduledAttachment[] | undefined,
 ): ScheduledAttachmentMetadata[] | undefined {
     if (!attachments || attachments.length === 0) return undefined;
-    return attachments.map(({ filename, size, sha256 }) => ({ filename, size, sha256 }));
+    return attachments.map(({ filename, size, sha256, cid, contentType }) => ({
+        filename,
+        size,
+        sha256,
+        ...(cid ? { cid } : {}),
+        ...(contentType ? { contentType } : {}),
+    }));
 }
 
 function resolveScheduledAttachment(
@@ -770,12 +1114,19 @@ function validateScheduledAttachmentSet(
         throw new Error(`At most ${MAX_ATTACHMENT_COUNT} scheduled attachments are allowed.`);
     }
     const relativePaths = new Set<string>();
+    const inlineCids = new Set<string>();
     let aggregateBytes = 0;
     return attachments.map(attachment => {
         if (relativePaths.has(attachment.relativePath)) {
             throw new Error('Duplicate scheduled attachment descriptors are not allowed.');
         }
         relativePaths.add(attachment.relativePath);
+        if (attachment.cid) {
+            if (inlineCids.has(attachment.cid)) {
+                throw new Error('Duplicate scheduled inline image cids are not allowed.');
+            }
+            inlineCids.add(attachment.cid);
+        }
         aggregateBytes += attachment.size;
         if (aggregateBytes > MAX_ATTACHMENT_AGGREGATE_BYTES) {
             throw new Error('Scheduled attachment aggregate exceeds the Gmail attachment limit.');
@@ -828,7 +1179,14 @@ export function loadScheduledAttachments(
         if (createHash('sha256').update(content).digest('hex') !== attachments[index].sha256) {
             throw new Error('Scheduled attachment failed its integrity check.');
         }
-        return { filename: snapshot.filename, content };
+        return {
+            filename: snapshot.filename,
+            content,
+            ...(attachments[index].cid ? { cid: attachments[index].cid } : {}),
+            ...(attachments[index].contentType
+                ? { contentType: attachments[index].contentType }
+                : {}),
+        };
     });
 }
 

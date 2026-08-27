@@ -12,7 +12,7 @@ import { OAuth2Client } from 'google-auth-library';
 import fs from 'fs';
 import path from 'path';
 import type { Server as HttpServer } from 'node:http';
-import {createEmailMessage, createEmailWithNodemailer} from "./utl.js";
+import {createEmailMessage, createEmailWithNodemailer, needsRawBuilder} from "./utl.js";
 import {
     loadScheduledAttachments,
     MAX_MANAGED_EXPORT_FILE_BYTES,
@@ -35,6 +35,7 @@ import {
     authenticate,
     completeGmailOAuthCallback,
     createGmailOAuthClient,
+    loadGmailCredentialsIntoClient,
     loadOAuthKeys,
     startLocalGmailOAuthFlow,
     startRemoteGmailOAuthFlow,
@@ -59,6 +60,7 @@ import {
 } from "./db.js";
 import { closeDefaultOAuthStateStore, getDefaultOAuthStateStore } from './oauth-store.js';
 import { createRemoteHttpApp, loadRemoteServerConfig } from './remote-http.js';
+import { resolveToolPrefix } from "./tool-prefix.js";
 
 
 // Dynamically resolve account credentials
@@ -87,20 +89,13 @@ async function getAccountClient(accountEmail?: string): Promise<{ gmail: any; au
 
     const oauthClient = createGmailOAuthClient(LOCAL_GMAIL_CALLBACK_URL, keys);
 
-    let scopes = DEFAULT_SCOPES;
-    if (fs.existsSync(credPath)) {
-        const credentials = JSON.parse(fs.readFileSync(credPath, 'utf8'));
-        const tokens = credentials.tokens || credentials;
-        oauthClient.setCredentials(tokens);
-        if (credentials.scopes) {
-            scopes = credentials.scopes;
-        }
-    } else {
+    if (!fs.existsSync(credPath)) {
         throw new Error(`Credentials file not found at ${credPath}`);
     }
+    const credentials = loadGmailCredentialsIntoClient(oauthClient, credPath);
 
     const gmail = createGmailClient({ version: 'v1', auth: oauthClient });
-    return { gmail, authorizedScopes: scopes, oauthClient };
+    return { gmail, authorizedScopes: credentials.scopes, oauthClient };
 }
 
 function parseScheduledTime(timeStr: string): string {
@@ -300,6 +295,14 @@ function installGracefulHttpShutdown(
     process.once('SIGINT', beginShutdown);
 }
 
+// Optional tool-name prefix — lets multiple instances of this server run side-by-side
+// without their tool names colliding in clients that disambiguate by base name.
+// Precedence: --tool-prefix=<value> / --tool-prefix <value> CLI flag, then
+// GMAIL_MCP_TOOL_PREFIX env var, then empty (no prefix → backward compatible).
+// Does not affect the `auth` subcommand, which is detected via process.argv[2] === 'auth'
+// and exits before the server starts — run `auth` without --tool-prefix.
+const TOOL_PREFIX = resolveToolPrefix(process.argv.slice(2), process.env);
+
 // Type definitions for Gmail API responses
 interface GmailMessagePart {
     partId?: string;
@@ -321,10 +324,6 @@ interface EmailContent {
     text: string;
     html: string;
 }
-
-// OAuth2 configuration
-let oauth2Client: OAuth2Client;
-let authorizedScopes: string[] = DEFAULT_SCOPES;
 
 /**
  * Recursively extract email body content from MIME message parts
@@ -419,25 +418,10 @@ async function loadCredentials(callbackUrl = LOCAL_GMAIL_CALLBACK_URL) {
         }
 
         const keys = loadOAuthKeys();
-        oauth2Client = createGmailOAuthClient(callbackUrl, keys);
+        const oauthClient = createGmailOAuthClient(callbackUrl, keys);
 
         if (fs.existsSync(CREDENTIALS_PATH)) {
-            const credentials = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf8'));
-
-            // Credentials file structure (v1.2.0+):
-            //   { "tokens": { access_token, refresh_token, ... }, "scopes": ["gmail.readonly", ...] }
-            //
-            // Legacy structure (pre-v1.2.0):
-            //   { access_token, refresh_token, ... }
-            //
-            // We support both formats for backwards compatibility. Users with legacy
-            // credentials will get DEFAULT_SCOPES (full access) until they re-authenticate.
-            const tokens = credentials.tokens || credentials;
-            oauth2Client.setCredentials(tokens);
-
-            if (credentials.scopes) {
-                authorizedScopes = credentials.scopes;
-            }
+            loadGmailCredentialsIntoClient(oauthClient, CREDENTIALS_PATH);
         }
     } catch (error: any) {
         console.error('Error loading credentials:', error.message || error);
@@ -490,9 +474,6 @@ async function main() {
         process.exit(0);
     }
 
-    // Initialize Gmail API
-    const gmail = createGmailClient({ version: 'v1', auth: oauth2Client });
-
     interface McpServerOptions {
         gmailOAuthPublicBaseUrl?: string;
     }
@@ -502,7 +483,7 @@ async function main() {
         const server = new Server(
             {
                 name: "gmail",
-                version: "1.0.0",
+                version: "2.0.0",
             },
             {
                 capabilities: {
@@ -524,20 +505,31 @@ async function main() {
         const availableTools = toolDefinitions.filter(tool =>
             hasScope(scopes, tool.scopes)
         );
-        return { tools: toMcpTools(availableTools) };
+        const mcpTools = toMcpTools(availableTools);
+        // Apply optional TOOL_PREFIX so multiple server instances can coexist
+        // in clients that dedupe tool entries by base name.
+        return { tools: mcpTools.map(t => ({ ...t, name: TOOL_PREFIX + t.name })) };
     });
 
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const { name, arguments: args } = request.params;
+        const { name: rawName, arguments: args } = request.params;
+
+        // A configured prefix is part of the callable tool name, not only its
+        // advertised alias. This keeps side-by-side instances isolated.
+        const name = TOOL_PREFIX
+            ? (rawName.startsWith(TOOL_PREFIX)
+                ? rawName.slice(TOOL_PREFIX.length)
+                : '')
+            : rawName;
         const validatedArgs = args as any;
 
-        const toolDef = getToolByName(name);
+        const toolDef = name ? getToolByName(name) : undefined;
         if (!toolDef) {
             return {
                 isError: true,
                 content: [{
                     type: "text",
-                    text: `Error: Tool "${name}" is not found.`,
+                    text: `Error: Tool "${rawName}" is not found.`,
                 }],
             };
         }
@@ -664,8 +656,8 @@ async function main() {
                     }
                 }
 
-                // Check if we have attachments
-                if (validatedArgs.attachments && validatedArgs.attachments.length > 0) {
+                // Route attachment- or inline-image-bearing mail through the raw MIME builder
+                if (needsRawBuilder(validatedArgs)) {
                     // Use Nodemailer to create properly formatted RFC822 message
                     message = await createEmailWithNodemailer(validatedArgs);
                     
@@ -719,7 +711,7 @@ async function main() {
                         };
                     }
                 } else {
-                    // For emails without attachments, use the existing simple method
+                    // For plain / simple-HTML mail with no attachments or inline images
                     message = createEmailMessage(validatedArgs);
                     
                     const encodedMessage = Buffer.from(message).toString('base64')
@@ -773,9 +765,11 @@ async function main() {
                     }
                 }
             } catch (error: any) {
-                // Log attachment-related errors for debugging
-                if (validatedArgs.attachments && validatedArgs.attachments.length > 0) {
-                    console.error(`Failed to send email with ${validatedArgs.attachments.length} attachments:`, error.message);
+                // Log attachment / inline-image errors for debugging
+                if (needsRawBuilder(validatedArgs)) {
+                    const nAtt = validatedArgs.attachments?.length || 0;
+                    const nImg = validatedArgs.inlineImages?.length || 0;
+                    console.error(`Failed to send email with ${nAtt} attachment(s) and ${nImg} inline image(s):`, error.message);
                 }
                 throw error;
             }
@@ -844,7 +838,11 @@ async function main() {
                         attempts: 0
                     };
                     
-                    enqueueScheduledEmail(newEmail, scheduleArgs.attachments ?? []);
+                    enqueueScheduledEmail(
+                        newEmail,
+                        scheduleArgs.attachments ?? [],
+                        scheduleArgs.inlineImages ?? [],
+                    );
                     
                     return {
                         content: [{
@@ -1150,7 +1148,7 @@ async function main() {
 
                     // Build the new MIME message using the same helpers as draft_email/send_email
                     let message: string;
-                    if (messageArgs.attachments && messageArgs.attachments.length > 0) {
+                    if (needsRawBuilder(messageArgs)) {
                         message = await createEmailWithNodemailer(messageArgs);
                     } else {
                         message = createEmailMessage(messageArgs);
@@ -1999,6 +1997,7 @@ async function main() {
                         threadId: threadId,
                         inReplyTo: originalMessageId,
                         attachments: validatedArgs.attachments,
+                        inlineImages: validatedArgs.inlineImages,
                     };
 
                     // Use the existing handleEmailAction to send the reply

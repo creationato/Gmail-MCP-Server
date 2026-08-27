@@ -14,6 +14,7 @@ import {
   spoolScheduledAttachments,
   toScheduledAttachmentMetadata,
   verifyScheduledAttachments,
+  type InlineImageInput,
   type ScheduledAttachment,
   type ScheduledAttachmentMetadata,
   type ScheduledAttachmentReference,
@@ -102,23 +103,41 @@ const AddressSchema = z.string().min(1).max(MAX_ADDRESS_CHARS);
 const AddressListSchema = z.array(AddressSchema).max(MAX_SCHEDULED_RECIPIENTS);
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 
-const ScheduledAttachmentMetadataSchema = z.object({
+const ScheduledAttachmentMetadataObject = z.object({
   filename: z.string().min(1).max(240).refine(
     value => value !== '.' && value !== '..' && !/[\\/\x00-\x1f\x7f]/.test(value),
     'Attachment filename must be a plain display filename.',
   ),
   size: z.number().int().nonnegative().max(MAX_ATTACHMENT_FILE_BYTES),
   sha256: Sha256Schema,
+  cid: z.string().min(1).max(256).regex(/^[^\s<>\x00-\x1f\x7f]+$/).optional(),
+  contentType: z.enum([
+    'image/png',
+    'image/jpeg',
+    'image/gif',
+    'image/webp',
+    'image/bmp',
+    'image/x-icon',
+  ]).optional(),
 }).strict();
 
-const ScheduledAttachmentSchema = ScheduledAttachmentMetadataSchema.extend({
+const ScheduledAttachmentMetadataSchema = ScheduledAttachmentMetadataObject.refine(
+  item => item.cid !== undefined || item.contentType === undefined,
+  {
+  message: 'Only inline MIME parts may declare contentType.',
+  },
+);
+
+const ScheduledAttachmentSchema = ScheduledAttachmentMetadataObject.extend({
   ownerId: z.string().regex(SCHEDULE_ID_PATTERN),
   bundleId: z.string().min(38).max(MAX_ID_CHARS + 37).regex(/^[A-Za-z0-9_-]+$/),
   relativePath: z.string().min(1).max(MAX_MANAGED_PATH_LENGTH).refine(
     value => !value.includes('\\') && !/[\x00-\x1f\x7f]/.test(value),
     'Scheduled attachment path is invalid.',
   ),
-}).strict();
+}).strict().refine(item => item.cid !== undefined || item.contentType === undefined, {
+  message: 'Only inline MIME parts may declare contentType.',
+});
 
 const ScheduledEmailSchema = z.object({
   id: z.string().regex(SCHEDULE_ID_PATTERN),
@@ -152,6 +171,7 @@ const ScheduledEmailSchema = z.object({
   }
   const paths = new Set<string>();
   const bundleIds = new Set<string>();
+  const inlineCids = new Set<string>();
   for (const attachment of attachments) {
     const segments = attachment.relativePath.split('/');
     if (
@@ -172,9 +192,18 @@ const ScheduledEmailSchema = z.object({
     }
     paths.add(attachment.relativePath);
     bundleIds.add(attachment.bundleId);
+    if (attachment.cid) {
+      if (inlineCids.has(attachment.cid)) {
+        context.addIssue({ code: z.ZodIssueCode.custom, message: 'Inline image cids must be unique.' });
+      }
+      inlineCids.add(attachment.cid);
+    }
   }
   if (bundleIds.size > 1) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: 'Attachments must use one owned bundle.' });
+  }
+  if (inlineCids.size > 0 && !email.htmlBody) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'Scheduled inline images require htmlBody.' });
   }
   if (metadata.reduce((total, attachment) => total + attachment.size, 0) > MAX_ATTACHMENT_AGGREGATE_BYTES) {
     context.addIssue({ code: z.ZodIssueCode.custom, message: 'Attachment metadata exceeds limits.' });
@@ -197,7 +226,9 @@ const ScheduledEmailSchema = z.object({
     } else if (metadata.some((item, index) => (
       item.filename !== attachments[index].filename ||
       item.size !== attachments[index].size ||
-      item.sha256 !== attachments[index].sha256
+      item.sha256 !== attachments[index].sha256 ||
+      item.cid !== attachments[index].cid ||
+      item.contentType !== attachments[index].contentType
     ))) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
@@ -588,12 +619,16 @@ export function updateQueue<T>(mutator: (queue: ScheduledEmail[]) => T, now = ne
 export function enqueueScheduledEmail(
   email: ScheduledEmail,
   sourceAttachmentPaths: string[] = [],
+  sourceInlineImages: InlineImageInput[] = [],
 ): void {
   if (email.attachments !== undefined || email.attachmentMetadata !== undefined) {
     throw new Error('New scheduled emails must use managed source paths.');
   }
   if (email.status !== 'pending' || email.attempts !== 0) {
     throw new Error('New scheduled emails must start pending with zero attempts.');
+  }
+  if (sourceInlineImages.length > 0 && !email.htmlBody) {
+    throw new Error('Scheduled inline images require htmlBody.');
   }
   if (email.to.length === 0) throw new Error('At least one scheduled recipient is required.');
   const baseEmail = ScheduledEmailSchema.parse({ ...email, attachments: undefined }) as ScheduledEmail;
@@ -606,8 +641,13 @@ export function enqueueScheduledEmail(
       if (queue.some(item => item.id === baseEmail.id)) {
         throw new Error(`Scheduled email with ID "${baseEmail.id}" already exists.`);
       }
-      createdAttachments = sourceAttachmentPaths.length > 0
-        ? spoolScheduledAttachments(baseEmail.id, sourceAttachmentPaths, CONFIG_DIR)
+      createdAttachments = sourceAttachmentPaths.length > 0 || sourceInlineImages.length > 0
+        ? spoolScheduledAttachments(
+          baseEmail.id,
+          sourceAttachmentPaths,
+          CONFIG_DIR,
+          sourceInlineImages,
+        )
         : undefined;
       queue.push({ ...baseEmail, attachments: createdAttachments });
     });

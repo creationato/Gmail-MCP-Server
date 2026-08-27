@@ -164,6 +164,114 @@ export function saveCredentialsFile(filePath: string, credentials: GmailCredenti
     }, getOAuthFileLockDirectory(filePath));
 }
 
+function mergeDefinedCredentials(
+    current: Credentials,
+    update: Credentials,
+): Credentials {
+    const merged: Credentials = { ...current };
+    for (const [key, value] of Object.entries(update)) {
+        if (value !== undefined) {
+            (merged as Record<string, unknown>)[key] = value;
+        }
+    }
+    return merged;
+}
+
+function parseCredentialsFile(
+    filePath: string,
+    fallbackScopes: string[],
+): GmailCredentialsFile {
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+    const tokens = parsed.tokens && typeof parsed.tokens === 'object' && !Array.isArray(parsed.tokens)
+        ? parsed.tokens as Credentials
+        : Object.fromEntries(
+            Object.entries(parsed).filter(([key]) => key !== 'scopes' && key !== 'tokens'),
+        ) as Credentials;
+    return {
+        tokens,
+        scopes: Array.isArray(parsed.scopes) ? parsed.scopes as string[] : fallbackScopes,
+    };
+}
+
+function getRefreshTokenGeneration(tokens: Credentials): string {
+    const refreshToken = typeof tokens.refresh_token === 'string'
+        ? tokens.refresh_token
+        : '';
+    return createHash('sha256')
+        .update(refreshToken.length > 0 ? 'present\0' : 'absent\0')
+        .update(refreshToken)
+        .digest('hex');
+}
+
+function attachTokenPersistenceForGeneration(
+    oauthClient: OAuth2Client,
+    filePath: string,
+    fallbackScopes: string[],
+    initialGeneration: string,
+): void {
+    let expectedGeneration = initialGeneration;
+    oauthClient.on('tokens', newTokens => {
+        try {
+            withStateLockSync(() => {
+                const current = parseCredentialsFile(filePath, fallbackScopes);
+                if (getRefreshTokenGeneration(current.tokens) !== expectedGeneration) return;
+
+                const updated: GmailCredentialsFile = {
+                    tokens: mergeDefinedCredentials(current.tokens, newTokens),
+                    scopes: current.scopes,
+                };
+                atomicWriteFile(
+                    filePath,
+                    `${JSON.stringify(updated, null, 2)}\n`,
+                    0o600,
+                );
+                expectedGeneration = getRefreshTokenGeneration(updated.tokens);
+            }, getOAuthFileLockDirectory(filePath));
+        } catch (error) {
+            console.error('Failed to persist refreshed Gmail OAuth tokens:', error);
+        }
+    });
+}
+
+export function attachGmailTokenPersistence(
+    oauthClient: OAuth2Client,
+    filePath: string,
+    fallbackScopes: string[],
+): void {
+    const initialGeneration = withStateLockSync(
+        () => getRefreshTokenGeneration(parseCredentialsFile(filePath, fallbackScopes).tokens),
+        getOAuthFileLockDirectory(filePath),
+    );
+    attachTokenPersistenceForGeneration(
+        oauthClient,
+        filePath,
+        fallbackScopes,
+        initialGeneration,
+    );
+}
+
+export function loadGmailCredentialsIntoClient(
+    oauthClient: OAuth2Client,
+    filePath: string,
+): GmailCredentialsFile {
+    const loaded = withStateLockSync(() => {
+        const credentials = parseCredentialsFile(filePath, DEFAULT_SCOPES);
+        return {
+            credentials,
+            generation: getRefreshTokenGeneration(credentials.tokens),
+        };
+    }, getOAuthFileLockDirectory(filePath));
+    const { credentials } = loaded;
+    oauthClient.setCredentials(credentials.tokens);
+    attachTokenPersistenceForGeneration(
+        oauthClient,
+        filePath,
+        credentials.scopes,
+        loaded.generation,
+    );
+    return credentials;
+}
+
 export function saveAccountCredentials(accountEmail: string, credentials: GmailCredentialsFile): string {
     const normalizedEmail = normalizeAccountEmail(accountEmail);
     const targetCredPath = getAccountCredentialsPath(normalizedEmail);
@@ -616,14 +724,15 @@ export async function completeGmailOAuthCallback(params: {
     }
 }
 
-function getLocalCallbackPort(redirectUri: string): number {
-    try {
-        const parsed = new URL(redirectUri);
-        if (parsed.port) return Number(parsed.port);
-    } catch {
-        // Fall through to the historical default.
-    }
-    return 3000;
+export function getLocalCallbackPort(redirectUri: string): number {
+    const parsed = new URL(redirectUri);
+    if (parsed.port) return Number(parsed.port);
+    if (parsed.protocol === 'http:') return 80;
+    if (parsed.protocol === 'https:') return 3000;
+    throw new GmailOAuthError(
+        'invalid_listen_host',
+        'The Gmail OAuth callback URL must use HTTP or HTTPS.',
+    );
 }
 
 export function validateLocalOAuthCallbackState(expected: string, received: string | null): void {

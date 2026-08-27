@@ -6,6 +6,19 @@ user-invocable: false
 
 # PR & Issue Review SOP
 
+## Project Philosophy (Read First - Governs Every Review)
+
+**SSoT: README.md § Philosophy.** This fork is **lean and pragmatic**. Local stdio MCP server, minimal dependencies, maintainer dogfoods it daily - "if I wouldn't run it or maintain it myself, it doesn't go in." The **maximalist** direction lives in the downstream fork **klodr/gmail-mcp** (unaffiliated); feature-hungry users get redirected there, politely, with the standard caveat that we don't track its security.
+
+**Every PR and issue assessment MUST include a philosophy verdict: MATCH / MISMATCH / NEUTRAL.**
+
+Heuristics:
+- **MATCH:** bugfixes, correctness/reliability of the existing surface, docs accuracy, test coverage for existing behavior, zero-dependency improvements, credential-safety per the local threat model.
+- **MISMATCH (default decline + redirect to klodr fork):** new feature surface the maintainer wouldn't use daily, new dependencies, infra/deployment expansion (Docker images, hosting), hardening classes the local threat model explicitly excludes (see Security Standards below), capabilities with an existing simple workaround (e.g. registering the server twice ≈ multi-account).
+- **NEUTRAL:** repo hygiene, triage, support/environmental issues, distribution of the existing lean server.
+
+MISMATCH handling: don't build it, don't merge it. **Pitch the item to the maintainer FIRST (angry-king style) and close only after his explicit call** - never auto-close a contributor's PR/issue on philosophy grounds alone (Arty directive 2026-07-10: outward-facing closures are his judgment, MISMATCH verdict or not). Once he says close: comment kindly, point to klodr/gmail-mcp, close.
+
 ## Branch Workflow
 
 **Two-branch model: `main` (stable) and `experimental` (staging).**
@@ -13,7 +26,17 @@ user-invocable: false
 1. Before starting a new batch of PR reviews/changes: merge `experimental` → `main` IF the experiment is confirmed successful. If no evidence, ask the user.
 2. PR merges and own changes go into `experimental` first. Never merge PRs directly into `main`.
 3. After a batch is complete on `experimental`: wait for user confirmation, then merge `experimental` → `main`.
-4. **After every push to any branch:** run `gh run list --branch {branch} --limit 1` and verify CI passes. If CI fails, fix immediately — do NOT leave broken CI for the user to discover. This applies to every `git push` in the session, not just merges.
+4. **After every push to any branch:** run `gh run list --branch {branch} --limit 1` and verify CI passes. If CI fails, fix immediately - do NOT leave broken CI for the user to discover. This applies to every `git push` in the session, not just merges.
+5. **End of each dev round (batch merged to `experimental`, awaiting soak):** create a task in the user's Personal CRM (`mcp__claude_ai_Personal_CRM__crm_create_task`, load via ToolSearch) titled "Promote Gmail-MCP experimental→main if soak clean", due ~1 week out (or whatever fits the round's size). The user tracks promotions there, not in GitHub. (Arty directive 2026-07-11.)
+
+## npm & MCP Registry Releases
+
+Published as **@artymclabin/gmail-mcp** on npm + **io.github.ArtyMcLabin/Gmail-MCP-Server** on the official MCP Registry.
+
+- **Tags are cut from `main` ONLY.** Pushing a `v*` tag triggers `.github/workflows/publish.yml` -> npm publish. Never tag `experimental` (incident 2026-07-11: v1.2.0/v1.2.1 tagged off experimental put unsoaked staging code on npm as `latest`; resolved by same-day promotion).
+- **Release procedure (at promotion):** merge `experimental`->`main` -> bump version in package.json + package-lock.json + server.json (both `version` fields) -> commit on main -> `git tag vX.Y.Z && git push origin vX.Y.Z` -> verify the "Publish release" workflow is green. The tag push publishes EVERYWHERE automatically: npm -> official MCP Registry (OIDC, no interactive login) -> Smithery (.mcpb bundle built in CI from `mcpb-manifest.json`, version-synced via jq). No manual `mcp-publisher` or `smithery` steps needed. First automated exercise: next release after 2026-07-11 - watch it end-to-end once.
+- `mcpName` in package.json must always equal `name` in server.json (registry ownership validation).
+- **NPM_TOKEN secret** rotation is tracked in the maintainer's PRIVATE task tracker (Personal CRM) - 🚨 NEVER document token/auth posture details (expiry dates, 2FA state, token types) in this public repo, including GitHub issues (incident 2026-07-11: such an issue was created and had to be deleted - supply-chain recon risk).
 
 ## PR Review Checklist (All Steps Mandatory)
 
@@ -28,49 +51,56 @@ user-invocable: false
 - If "help wanted" / "needs help": assess if anyone volunteered, if PR is stale, if requested help was provided.
 
 ### Step 3: Security Audit (Conditional)
-- **Skip security audit for PRs with "help wanted" label that are still waiting for community testing/volunteers.** These PRs are parked — auditing them wastes resources. Report a one-liner instead: "PR #N: still waiting for community help, no action needed."
+- **Skip security audit for PRs with "help wanted" label that are still waiting for community testing/volunteers.** These PRs are parked - auditing them wastes resources. Report a one-liner instead: "PR #N: still waiting for community help, no action needed."
 - For all other PRs: run comprehensive security audit using `security-auditor` subagent.
-- Explicitly report verdict: "Security audit: **PASS**" or "Security audit: **FAIL** — [findings]"
+- Explicitly report verdict: "Security audit: **PASS**" or "Security audit: **FAIL** - [findings]"
 - Never present a PR review to user without a completed security audit (unless skipped per above).
 - For FAIL verdicts: list all findings with severity (CRITICAL/HIGH/MEDIUM/LOW/INFO).
-- **Local MCP threat model:** This is a local stdio MCP server (user self-hosts on own PC, not remote/hosted). The LLM client already has full filesystem/shell access. Path traversal, filename injection, and local XSS are NOT security issues in this context — the "attacker" (LLM) already has more powerful tools (Bash, Write). Only flag issues that represent actual risk in the local threat model (e.g., credential leaks to third parties, network-exposed endpoints, dependency supply chain). Do NOT flag local filesystem operations as security vulnerabilities.
+- **Local MCP threat model:** This is a local stdio MCP server (user self-hosts on own PC, not remote/hosted). The LLM client already has full filesystem/shell access. Path traversal, filename injection, and local XSS are NOT security issues in this context - the "attacker" (LLM) already has more powerful tools (Bash, Write). Only flag issues that represent actual risk in the local threat model (e.g., credential leaks to third parties, network-exposed endpoints, dependency supply chain). Do NOT flag local filesystem operations as security vulnerabilities.
 
 ### Step 4: Code Review
 - Check for merge conflicts, build breakage, test failures.
 - Verify consistency with project's established patterns (security hardening, coding style).
 - Note missing tests, documentation gaps, dependency concerns.
 
-### Step 5: Present Findings
-- Each PR gets: security verdict, comment summary, label status, code review findings, recommendation (approve/request changes/close).
-- **All tables (PRs and issues) MUST include the author/opener name.** Never omit who created the PR or issue — the user needs this for context.
+### Step 5: Philosophy Alignment (Mandatory)
+- Assess against **Project Philosophy** (top of this file; SSoT = README.md § Philosophy).
+- Verdict per PR: **MATCH / MISMATCH / NEUTRAL** with one-line reasoning.
+- MISMATCH default action: request changes or close + redirect to klodr/gmail-mcp - regardless of code quality or security PASS.
+
+### Step 6: Present Findings
+- Each PR gets: security verdict, **philosophy verdict**, comment summary, label status, code review findings, recommendation (approve/request changes/close).
+- **All tables (PRs and issues) MUST include the author/opener name AND the created date** (last-update date too when it differs meaningfully). Never omit who created the PR/issue or when - the user needs both for context.
+- **Pitch decisions in Angry King style by default** (`~/.claude/output-styles/angry-king.md`): one PR at a time, self-contained ≤300-char pitch with date + author, closed A/B/C options, `→ rec:` marked. No technical detail unless asked.
 
 ## Merge Flow (When Approving)
 
-**Use GitHub's merge to get the purple "merged" badge — do NOT close manually.**
+**Use GitHub's merge to get the purple "merged" badge - do NOT close manually.**
 
 1. `gh pr edit {N} --base experimental` (retarget PR to experimental BEFORE any local merge)
 2. If post-merge fixes are needed (indentation, lockfiles, missing annotations, etc.):
-   a. Fetch and fix locally on experimental, push — the PR diff updates automatically.
+   a. Fetch and fix locally on experimental, push - the PR diff updates automatically.
    b. Or: merge first via GitHub, then commit fixes on top.
-3. `gh pr merge {N} --merge` (merge via GitHub — shows purple "merged" badge, credits the contributor)
-4. **Verify CI:** `gh run list --branch experimental --limit 1` — wait for result. If CI fails, fix before proceeding.
+3. `gh pr merge {N} --merge` (merge via GitHub - shows purple "merged" badge, credits the contributor)
+4. **Verify CI:** `gh run list --branch experimental --limit 1` - wait for result. If CI fails, fix before proceeding.
 5. Comment on PR explaining security audit result + any post-merge fixes applied.
 
 **Why not manual close:** "Closed" (red) looks like rejection to contributors and doesn't credit their work on their GitHub profile. Always use `gh pr merge` for accepted PRs.
 
 **Post-merge integration test (mandatory for feature PRs):**
-After merging a PR that adds new tools or features, rebuild from source (`npm run build`) and test the actual new functionality end-to-end. Do NOT simulate by using existing tools that happen to call the same API — test the actual new code path. For new MCP tools: rebuild, then invoke the tool via the local MCP server or direct `node` execution to verify it returns correct data.
+After merging a PR that adds new tools or features, rebuild from source (`npm run build`) and test the actual new functionality end-to-end. Do NOT simulate by using existing tools that happen to call the same API - test the actual new code path. For new MCP tools: rebuild, then invoke the tool via the local MCP server or direct `node` execution to verify it returns correct data.
 
-**If `gh pr merge` can't be used (conflicts):** Merge locally, resolve conflicts, push to the target branch. GitHub will auto-detect the PR as merged when the PR's head commit appears in the target branch history. Leave the PR open (don't close manually) — let GitHub close it automatically with the purple badge.
+**If `gh pr merge` can't be used (conflicts):** Merge locally, resolve conflicts, push to the target branch. GitHub will auto-detect the PR as merged when the PR's head commit appears in the target branch history. Leave the PR open (don't close manually) - let GitHub close it automatically with the purple badge.
 
 ## Staleness Policy
 
-- PRs with "help wanted" label: keep open for up to 6 months. Close if no community participation by then.
+- PRs with "help wanted" label: keep open for up to **8 months from creation** (Arty directive 2026-07-10, supersedes the earlier 6-month rule). Close as stale if no community participation by then.
 - Stale PRs without label: assess on a case-by-case basis.
 
 ## Issue Review (Same Rules Apply)
 
 When scanning issues:
+- **Philosophy verdict (MATCH / MISMATCH / NEUTRAL) mandatory per issue**, same heuristics as PRs. Feature requests default MISMATCH -> decline + redirect to klodr/gmail-mcp unless maintainer would use it daily.
 - Read all comments.
 - Check labels ("help wanted", "needs help", "bug", "enhancement", etc.).
 - Assess actionability: is someone working on it? Is it stale? Is help still needed?

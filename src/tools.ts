@@ -2,6 +2,8 @@ import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
 import {
   MAX_ATTACHMENT_COUNT,
+  hasCanonicalBase64Syntax,
+  MAX_INLINE_IMAGE_BASE64_CHARS,
   MAX_MANAGED_PATH_LENGTH,
 } from './managed-files.js';
 import {
@@ -22,6 +24,58 @@ const ManagedAttachmentPathsSchema = z.array(
 );
 
 // Schema definitions
+
+// Inline image embedded in an HTML body and referenced via a cid: URL.
+// Exactly one of `path` / `content` must be set; `contentType` is required with `content`.
+// Runtime preparation detects the bitmap type from bytes and treats a supplied type as an assertion.
+export const InlineImageSchema = z.object({
+  cid: z.string().min(1).max(256).regex(/^[^\s<>\x00-\x1f\x7f]+$/, "cid contains unsafe characters")
+    .describe("Content-ID for the image, referenced from htmlBody as <img src=\"cid:CID\">"),
+  path: z.string().min(1).max(MAX_MANAGED_PATH_LENGTH).optional()
+    .describe("Image in the managed import/export library; relative paths resolve under managed imports. MIME type is detected from its bytes."),
+  content: z.string().min(4).max(MAX_INLINE_IMAGE_BASE64_CHARS).refine(
+    hasCanonicalBase64Syntax,
+    'content must be canonical padded base64',
+  ).optional().describe("Canonical base64-encoded image data (use this OR path)"),
+  contentType: z.enum(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/x-icon']).optional()
+    .describe("Image MIME type — required when using `content` and must match its bytes. SVG is intentionally unsupported."),
+  filename: z.string().min(1).max(240).refine(
+    value => value !== '.' && value !== '..' && !/[\\/\x00-\x1f\x7f]/.test(value),
+    'filename must be a plain display filename',
+  ).optional().describe("Display filename for the image part (defaults derived from path or cid)"),
+})
+  .refine(d => (d.path ? 1 : 0) + (d.content ? 1 : 0) === 1, {
+    message: "Each inline image must set exactly one of `path` or `content`",
+  })
+  .refine(d => !d.content || !!d.contentType, {
+    message: "`contentType` is required when an inline image uses `content`",
+  });
+
+const InlineImagesSchema = z.array(InlineImageSchema).max(MAX_ATTACHMENT_COUNT);
+
+function validateMimePartFields(
+  data: { attachments?: string[]; inlineImages?: Array<{ cid: string }>; htmlBody?: string },
+  context: z.RefinementCtx,
+): void {
+  const total = (data.attachments?.length ?? 0) + (data.inlineImages?.length ?? 0);
+  if (total > MAX_ATTACHMENT_COUNT) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `At most ${MAX_ATTACHMENT_COUNT} total attachments and inline images are allowed.`,
+    });
+  }
+  if ((data.inlineImages?.length ?? 0) > 0 && !data.htmlBody) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: 'inlineImages require htmlBody.' });
+  }
+  const cids = new Set<string>();
+  for (const image of data.inlineImages ?? []) {
+    if (cids.has(image.cid)) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: `Duplicate inline image cid '${image.cid}'.` });
+    }
+    cids.add(image.cid);
+  }
+}
+
 export const SendEmailSchema = z.object({
   account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   to: z.array(z.string()).describe("List of recipient email addresses"),
@@ -35,7 +89,8 @@ export const SendEmailSchema = z.object({
   threadId: z.string().optional().describe("Thread ID to reply to"),
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
   attachments: ManagedAttachmentPathsSchema.optional().describe("Files from the managed import/export library to attach. At most 10 unique paths; relative paths resolve under managed imports."),
-});
+  inlineImages: InlineImagesSchema.optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
+}).superRefine(validateMimePartFields);
 
 export const ReadEmailSchema = z.object({
   account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
@@ -86,7 +141,8 @@ export const UpdateDraftSchema = z.object({
   threadId: z.string().optional().describe("Thread ID to reply to"),
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
   attachments: ManagedAttachmentPathsSchema.optional().describe("Files from the managed import/export library to attach. At most 10 unique paths; relative paths resolve under managed imports."),
-});
+  inlineImages: InlineImagesSchema.optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
+}).superRefine(validateMimePartFields);
 
 export const ListEmailLabelsSchema = z.object({
   account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
@@ -245,7 +301,8 @@ export const ReplyAllSchema = z.object({
   htmlBody: z.string().optional().describe("HTML version of the reply body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
   attachments: ManagedAttachmentPathsSchema.optional().describe("Files from the managed import/export library to attach. At most 10 unique paths; relative paths resolve under managed imports."),
-});
+  inlineImages: InlineImagesSchema.optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
+}).superRefine(validateMimePartFields);
 
 // --- NEW SCHEMAS FOR MULTI-ACCOUNT & SCHEDULING ---
 
@@ -262,8 +319,9 @@ export const ScheduleEmailSchema = z.object({
   threadId: z.string().max(2048).optional().describe("Thread ID to reply to"),
   inReplyTo: z.string().max(2048).optional().describe("Message ID being replied to"),
   attachments: ManagedAttachmentPathsSchema.optional().describe("Files from the managed import/export library to spool and attach. At most 10 unique paths and 25 MiB total."),
+  inlineImages: InlineImagesSchema.optional().describe("Images to spool and embed by cid. Path sources must be managed; base64 is decoded before queue persistence."),
   scheduledTime: z.string().describe("ISO 8601 timestamp (e.g., '2026-05-28T15:00:00Z') or relative time string (e.g., '+5 minutes', '+2 hours', '+1 day') when the email should be sent."),
-});
+}).superRefine(validateMimePartFields);
 
 export const ListScheduledEmailsSchema = z.object({
   status: z.enum(['pending', 'sending', 'sent', 'failed', 'uncertain']).optional().describe("Filter scheduled emails by status"),
@@ -366,14 +424,14 @@ export const toolDefinitions: ToolDefinition[] = [
   // Email write operations
   {
     name: "send_email",
-    description: "Sends a new email",
+    description: "Sends a new email. Supports plain text, HTML, file attachments, and images embedded inline in the HTML body via inlineImages.",
     schema: SendEmailSchema,
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Send Email", destructiveHint: false },
   },
   {
     name: "draft_email",
-    description: "Draft a new email",
+    description: "Draft a new email. Supports plain text, HTML, file attachments, and images embedded inline in the HTML body via inlineImages.",
     schema: SendEmailSchema,
     scopes: ["gmail.modify", "gmail.compose"],
     annotations: { title: "Draft Email", destructiveHint: false },
@@ -408,9 +466,9 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "delete_email",
-    description: "Permanently deletes an email",
+    description: "Permanently deletes an email. Requires gmail.full because Gmail's delete endpoint is not covered by gmail.modify.",
     schema: DeleteEmailSchema,
-    scopes: ["gmail.modify"],
+    scopes: ["gmail.full"],
     annotations: { title: "Delete Email", destructiveHint: true },
   },
   {
@@ -436,9 +494,9 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "batch_delete_emails",
-    description: "Permanently deletes multiple emails in batches",
+    description: "Permanently deletes multiple emails in batches. Requires gmail.full because Gmail's batchDelete endpoint is not covered by gmail.modify.",
     schema: BatchDeleteEmailsSchema,
-    scopes: ["gmail.modify"],
+    scopes: ["gmail.full"],
     annotations: { title: "Batch Delete Emails", destructiveHint: true },
   },
 

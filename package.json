@@ -1,7 +1,8 @@
 {
-  "name": "@gongrzhe/server-gmail-autoauth-mcp",
+  "name": "@artymclabin/gmail-mcp",
   "version": "2.0.0",
-  "description": "Gmail MCP server with auto authentication support",
+  "mcpName": "io.github.ArtyMcLabin/Gmail-MCP-Server",
+  "description": "Lean Gmail MCP server with auto authentication support (maintained fork of GongRzhe/Gmail-MCP-Server)",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -13,7 +14,7 @@
     "start": "node dist/index.js",
     "auth": "node dist/index.js auth",
     "test": "vitest run",
-    "test:process": "npm run build && node test/remote-server-process.mjs && node test/stdio-server-process.mjs",
+    "test:process": "npm run build && node test/remote-server-process.mjs && node test/stdio-server-process.mjs && node test/queue-process.mjs && node test/oauth-file-lock-process.mjs",
     "test:watch": "vitest",
     "lockfile:lint": "lockfile-lint --path package-lock.json --type npm --validate-https --allowed-hosts npm",
     "prepare": "npm run build",
@@ -34,8 +35,11 @@
     "claude",
     "auto-auth"
   ],
-  "author": "gongrzhe",
-  "license": "ISC",
+  "author": "Arty McLabin",
+  "contributors": [
+    "gongrzhe (original upstream author)"
+  ],
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ArtyMcLabin/Gmail-MCP-Server.git"

@@ -23,7 +23,10 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          COMMIT_MSG=$(git log -1 --format=%s)
+          # %B = full commit message (subject + body), so [skip-readme] is honored
+          # wherever it appears — matching the CI error text and the README docs,
+          # which both say "commit message" (not "subject line").
+          COMMIT_MSG=$(git log -1 --format=%B)
           # Skip on explicit flag
           if echo "$COMMIT_MSG" | grep -qiE '\[(skip-readme|no-readme)\]'; then
             echo "skip=true" >> "$GITHUB_OUTPUT"

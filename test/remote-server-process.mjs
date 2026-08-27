@@ -79,6 +79,7 @@ async function startServer(port, options = {}) {
             GMAIL_MCP_OAUTH_CALLBACKS: CALLBACK_URL,
             GMAIL_MCP_STATE_DIR: stateDirectory,
             GMAIL_OAUTH_PATH: path.join(stateDirectory, 'missing-google-oauth-keys.json'),
+            GMAIL_MCP_TOOL_PREFIX: 'remote_',
             ...(options.shutdownTimeoutMs
                 ? { GMAIL_MCP_SHUTDOWN_TIMEOUT_MS: String(options.shutdownTimeoutMs) }
                 : {}),
@@ -217,6 +218,7 @@ try {
     assert.match(initialize.headers.get('content-type') || '', /^application\/json/);
     const initializeResult = await initialize.json();
     assert.equal(initializeResult.result.serverInfo.name, 'gmail');
+    assert.equal(initializeResult.result.serverInfo.version, '2.0.0');
 
     const listTools = await mcpRequest(baseUrl, tokens.access_token, {
         jsonrpc: '2.0',
@@ -227,7 +229,30 @@ try {
     assert.equal(listTools.status, 200);
     const toolsResult = await listTools.json();
     assert.ok(toolsResult.result.tools.length > 0);
-    assert.ok(toolsResult.result.tools.some(tool => tool.name === 'list_accounts'));
+    assert.ok(toolsResult.result.tools.some(tool => tool.name === 'remote_list_accounts'));
+    assert.ok(!toolsResult.result.tools.some(tool => tool.name === 'list_accounts'));
+
+    const listAccounts = await mcpRequest(baseUrl, tokens.access_token, {
+        jsonrpc: '2.0',
+        id: 21,
+        method: 'tools/call',
+        params: { name: 'remote_list_accounts', arguments: {} },
+    });
+    assert.equal(listAccounts.status, 200);
+    const listAccountsResult = await listAccounts.json();
+    assert.match(listAccountsResult.result.content[0].text, /"accounts"/);
+
+    const hiddenUnprefixedCall = await mcpRequest(baseUrl, tokens.access_token, {
+        jsonrpc: '2.0',
+        id: 22,
+        method: 'tools/call',
+        params: { name: 'list_accounts', arguments: {} },
+    });
+    assert.equal(hiddenUnprefixedCall.status, 200);
+    const hiddenUnprefixedResult = await hiddenUnprefixedCall.json();
+    assert.equal(hiddenUnprefixedResult.result.isError, true);
+    assert.match(hiddenUnprefixedResult.result.content[0].text, /not found/);
+
 
     const sigtermShutdown = await stopServer();
     assert.equal(sigtermShutdown.timedOut, false);

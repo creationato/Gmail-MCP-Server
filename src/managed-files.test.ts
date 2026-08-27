@@ -228,6 +228,25 @@ describe('managed exports', () => {
 });
 
 describe('scheduled attachment spooling', () => {
+    it('persists inferred, byte-verified inline MIME metadata', () => {
+        const png = Buffer.from(
+            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=',
+            'base64',
+        );
+        const imagePath = path.join(getManagedImportDirectory(stateDirectory), 'scheduled.png');
+        fs.writeFileSync(imagePath, png, { mode: 0o600 });
+
+        const descriptors = spoolScheduledAttachments(
+            'inline-metadata',
+            [],
+            stateDirectory,
+            [{ cid: 'logo', path: 'scheduled.png' }],
+        );
+        expect(descriptors[0]).toMatchObject({ cid: 'logo', contentType: 'image/png' });
+        expect(loadScheduledAttachments('inline-metadata', descriptors, stateDirectory)[0])
+            .toMatchObject({ cid: 'logo', contentType: 'image/png', content: png });
+    });
+
     it('survives moving the complete state tree to a different VM path', () => {
         writeImport('portable.txt', 'bytes survive migration');
         const descriptors = spoolScheduledAttachments(

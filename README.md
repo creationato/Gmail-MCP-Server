@@ -1,37 +1,47 @@
-# Gmail AutoAuth MCP Server (Actively Maintained Fork)
+![Gmail MCP Server](assets/banner.jpg)
 
-**Installation:** just tell your Claude to install the MCP from this repo — point it at `https://github.com/ArtyMcLabin/Gmail-MCP-Server` and let it set up. Prefer manual steps? See [Installation & Authentication](#installation--authentication).
+# Gmail MCP Server (Actively Maintained Fork)
 
-[![CI](https://github.com/ArtyMcLabin/Gmail-MCP-Server/actions/workflows/ci.yml/badge.svg)](https://github.com/ArtyMcLabin/Gmail-MCP-Server/actions/workflows/ci.yml)
+**Installation:** `npx @artymclabin/gmail-mcp auth` - or just tell your Claude to install the MCP from this repo (`https://github.com/ArtyMcLabin/Gmail-MCP-Server`) and let it set up. Prefer manual steps? See [Installation & Authentication](#installation--authentication).
+
+[![CI](https://github.com/ArtyMcLabin/Gmail-MCP-Server/actions/workflows/ci.yml/badge.svg)](https://github.com/ArtyMcLabin/Gmail-MCP-Server/actions/workflows/ci.yml) [![npm](https://img.shields.io/npm/v/@artymclabin/gmail-mcp)](https://www.npmjs.com/package/@artymclabin/gmail-mcp)
+
+Also on the [official MCP Registry](https://registry.modelcontextprotocol.io) (`io.github.ArtyMcLabin/Gmail-MCP-Server`) and [Smithery](https://smithery.ai/servers/rawceo/gmail-mcp).
 
 > **This is an actively maintained fork of [GongRzhe/Gmail-MCP-Server](https://github.com/GongRzhe/Gmail-MCP-Server).**
 >
-> The original repository has been unmaintained since August 2025 — 7+ months with zero maintainer activity and 72+ unmerged pull requests. I use this MCP server daily as part of my Claude Code workflow and depend on it working correctly, so I picked it up.
+> The original repository has been unmaintained since August 2025 - 7+ months with zero maintainer activity and 72+ unmerged pull requests. I use this MCP server daily as part of my Claude Code workflow and depend on it working correctly, so I picked it up.
 >
 > **Pull requests are welcome.** If you've been sitting on fixes or features with nowhere to submit them, this is the place.
 
 ## Philosophy
 
-This fork is **lean and pragmatic**. It's a local stdio MCP server — you run it on your own machine, and your LLM client already has shell + filesystem access. So the threat model is "don't leak credentials to third parties, don't break the Gmail surface" — not "defend a hosted multi-tenant service". I keep dependencies minimal. I use this daily in my own Claude Code workflow — if I wouldn't run it or maintain it myself, it doesn't go in.
+This fork is **lean and pragmatic**. It supports local stdio use and a self-hosted Streamable HTTP deployment. Remote mode fails closed, persists connector OAuth state, and assumes one trusted operator rather than an untrusted multi-tenant service. Dependencies and operational state are kept explicit and bounded.
 
-There's a downstream fork that took this in the **maximalist** direction. I'm not affiliated with its maintainer and I don't track its security or features — use it at your own risk: **[klodr/gmail-mcp](https://github.com/klodr/gmail-mcp)**. If that's the philosophy you want, go check it out. PRs welcome here as always.
+There's a downstream fork that took this in the **maximalist** direction. I'm not affiliated with its maintainer and I don't track its security or features - use it at your own risk: **[klodr/gmail-mcp](https://github.com/klodr/gmail-mcp)**. If that's the philosophy you want, go check it out. PRs welcome here as always.
 
 ### What this fork adds
 
-- **Fixed reply threading** — auto-resolves `In-Reply-To` and `References` headers so email replies land in the correct thread instead of creating orphaned messages ([upstream PR #91](https://github.com/GongRzhe/Gmail-MCP-Server/pull/91), still pending)
-- **Send-as alias support** — optional `from` parameter for multi-identity email management (send from any configured Gmail alias)
-- **Reply-all tool** — `reply_all` automatically fetches the original email, builds To/CC recipient lists (excluding yourself), and sets proper threading headers ([PR #3](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/3) by [@MaxGhenis](https://github.com/MaxGhenis))
-- **Fixed `list_filters`** — was returning empty array due to wrong response property name ([PR #4](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/4) by [@nicholas-anthony-ai](https://github.com/nicholas-anthony-ai))
-- **Custom OAuth2 scoping** — `--scopes` flag to request only the permissions you need, with automatic tool filtering ([PR #6](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/6) by [@tansanDOTeth](https://github.com/tansanDOTeth))
-- **CI/CD hardening** — fixed shell injection vector in GitHub Actions workflow, added least-privilege permissions scope ([PR #9](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/9) by [@JF10R](https://github.com/JF10R))
-- **Security hardening** — fixed path traversal in attachment download, restricted OAuth credential file permissions ([PR #10](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/10) by [@JF10R](https://github.com/JF10R))
-- **Dependency security** — upgraded MCP SDK to v1.27.1 (3 CVE fixes), upgraded nodemailer (DoS + routing fix), moved dev-only packages out of production deps ([PR #11](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/11) by [@JF10R](https://github.com/JF10R))
-- **Thread-level tools** — `get_thread`, `list_inbox_threads`, `get_inbox_with_threads`, `modify_thread` for efficient thread-based email operations in a single call
-- **CC/BCC visibility** — `read_email` now shows CC and BCC headers when present ([PR #21](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/21) by [@panghy](https://github.com/panghy))
-- **Phishing report tools** — `report_phishing` and `batch_report_phishing` for marking messages as spam via the Gmail API ([PR #24](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/24) by [@ShivamB25](https://github.com/ShivamB25))
-- **Draft lifecycle tools** — `send_draft`, `delete_draft`, `update_draft` close the orphan-draft gap: `send_draft` atomically sends an existing draft and removes it from Drafts (no ghost copy); `update_draft` mutates a draft in place preserving its ID (no draft pile-up across iteration loops); `delete_draft` discards an abandoned draft ([PR #30](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/30) by [@thisisambros](https://github.com/thisisambros))
-- **Tool annotations** — MCP spec annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) on all tools for safer LLM tool execution ([PR #14](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/14) by [@bryankthompson](https://github.com/bryankthompson))
-- **Download email tool** — `download_email` saves emails to disk in json/eml/txt/html formats without consuming LLM context ([PR #13](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/13) by [@icanhasjonas](https://github.com/icanhasjonas))
+- **Fixed reply threading** - auto-resolves `In-Reply-To` and `References` headers so email replies land in the correct thread instead of creating orphaned messages ([upstream PR #91](https://github.com/GongRzhe/Gmail-MCP-Server/pull/91), still pending)
+- **Send-as alias support** - optional `from` parameter for multi-identity email management (send from any configured Gmail alias)
+- **Reply-all tool** - `reply_all` automatically fetches the original email, builds To/CC recipient lists (excluding yourself), and sets proper threading headers ([PR #3](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/3) by [@MaxGhenis](https://github.com/MaxGhenis))
+- **Fixed `list_filters`** - was returning empty array due to wrong response property name ([PR #4](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/4) by [@nicholas-anthony-ai](https://github.com/nicholas-anthony-ai))
+- **Custom OAuth2 scoping** - `--scopes` flag to request only the permissions you need, with automatic tool filtering ([PR #6](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/6) by [@tansanDOTeth](https://github.com/tansanDOTeth))
+- **CI/CD hardening** - fixed shell injection vector in GitHub Actions workflow, added least-privilege permissions scope ([PR #9](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/9) by [@JF10R](https://github.com/JF10R))
+- **Security hardening** - fixed path traversal in attachment download, restricted OAuth credential file permissions ([PR #10](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/10) by [@JF10R](https://github.com/JF10R))
+- **Dependency security** - upgraded MCP SDK to v1.27.1 (3 CVE fixes), upgraded nodemailer (DoS + routing fix), moved dev-only packages out of production deps ([PR #11](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/11) by [@JF10R](https://github.com/JF10R))
+- **Thread-level tools** - `get_thread`, `list_inbox_threads`, `get_inbox_with_threads`, `modify_thread` for efficient thread-based email operations in a single call
+- **CC/BCC visibility** - `read_email` now shows CC and BCC headers when present ([PR #21](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/21) by [@panghy](https://github.com/panghy))
+- **Phishing report tools** - `report_phishing` and `batch_report_phishing` for marking messages as spam via the Gmail API ([PR #24](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/24) by [@ShivamB25](https://github.com/ShivamB25))
+- **Draft lifecycle tools** - `send_draft`, `delete_draft`, `update_draft` close the orphan-draft gap: `send_draft` atomically sends an existing draft and removes it from Drafts (no ghost copy); `update_draft` mutates a draft in place preserving its ID (no draft pile-up across iteration loops); `delete_draft` discards an abandoned draft ([PR #30](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/30) by [@thisisambros](https://github.com/thisisambros))
+- **Tool annotations** - MCP spec annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) on all tools for safer LLM tool execution ([PR #14](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/14) by [@bryankthompson](https://github.com/bryankthompson))
+- **Download email tool** - `download_email` saves emails to disk in json/eml/txt/html formats without consuming LLM context ([PR #13](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/13) by [@icanhasjonas](https://github.com/icanhasjonas))
+- **Durable OAuth sessions** - `refresh_token` is persisted across restarts, ending the hourly re-auth loop ([PR #35](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/35) by [@BrentBaccala](https://github.com/BrentBaccala))
+- **Custom OAuth callback port** - the auth listener derives port and path from your callback URL instead of hardcoding 3000 ([PR #41](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/41) by [@soapergem](https://github.com/soapergem))
+- **Safe permanent-delete gating** - `delete_email`/`batch_delete_emails` require the opt-in `gmail.full` scope (which also satisfies all other mail scopes), so default auth stays least-privilege ([PR #39](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/39) by [@caioribeiroclw-pixel](https://github.com/caioribeiroclw-pixel))
+- **Durable remote MCP** - Streamable HTTP, OAuth dynamic registration/PKCE, rotating refresh tokens, bounded request handling, and restart-safe connector state
+- **Managed files** - attachment imports and downloads stay inside bounded managed roots with traversal, symlink, hardlink, and file-change checks
+- **Crash-safe scheduling** - one scheduler lease, durable claims, owner-bound attachment spools, and explicit reconciliation for uncertain sends
 
 All features are production-tested in daily use.
 
@@ -46,11 +56,11 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 
 ## Features
 
-- Send emails with subject, content, **attachments**, and recipients
-- **Full attachment support** - send and receive file attachments
-- **Download email attachments** to local filesystem
-- **Download full emails** to files in json/eml/txt/html formats
-- **Thread-level operations** — get full threads, list inbox threads, batch-expand threads
+- Send emails with subject, content, **managed attachments**, inline images, and recipients
+- **Managed attachment support** - send files from managed imports and receive files into managed exports
+- **Download email attachments** into the managed export library
+- **Download full emails** into managed exports in json/eml/txt/html formats
+- **Thread-level operations** - get full threads, list inbox threads, batch-expand threads
 - Support for HTML emails and multipart messages with both HTML and plain text versions
 - Full support for international characters in subject lines and email content
 - Read email messages by ID with advanced MIME structure handling
@@ -70,7 +80,13 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 
 ## Installation & Authentication
 
-### Installing from this fork
+### Installing from npm (recommended)
+
+```bash
+npx @artymclabin/gmail-mcp auth
+```
+
+### Installing from source
 
 Node.js 24 or newer is required because the persistent remote OAuth state uses
 the built-in `node:sqlite` module.
@@ -82,7 +98,7 @@ npm install
 npm run build
 ```
 
-> **Note**: The `npx @gongrzhe/server-gmail-autoauth-mcp` commands found in older docs reference the [unmaintained upstream fork](https://github.com/GongRzhe/Gmail-MCP-Server). To use **this** fork's features, install from source as shown above.
+> **Note**: The `npx @gongrzhe/server-gmail-autoauth-mcp` commands found in older docs reference the [unmaintained upstream fork](https://github.com/GongRzhe/Gmail-MCP-Server). This fork is published as [`@artymclabin/gmail-mcp`](https://www.npmjs.com/package/@artymclabin/gmail-mcp).
 
 ### Setting up Google Cloud credentials
 
@@ -135,6 +151,14 @@ npm run build
    > - After successful authentication, credentials are stored globally in `~/.gmail-mcp/` and can be used from any directory
    > - Both Desktop app and Web application credentials are supported
    > - For Web application credentials, make sure every callback URL you use is listed in Google Cloud authorized redirect URIs
+
+   **Custom callback URL / port:** By default the local OAuth server listens on port `3000` at `/oauth2callback`. If port 3000 is unavailable, or you need a different redirect URI, pass a full callback URL as an argument. The listener automatically binds to the port and path from that URL:
+
+   ```bash
+   node dist/index.js auth http://localhost:8080/oauth2callback
+   ```
+
+   The URL you pass must exactly match one of the authorized redirect URIs registered in the Google Cloud Console.
 
 3. Configure in Claude Desktop:
 
@@ -293,6 +317,20 @@ Add `${GMAIL_MCP_PUBLIC_ORIGIN}${GMAIL_MCP_BASE_PATH}/oauth2callback` to the aut
 
 This approach allows authentication flows to work properly in environments where localhost isn't accessible, such as containerized applications or cloud servers.
 
+## Ubuntu Service Deployment
+
+For a durable Ubuntu 24.04 or 26.04 service installation, use the self-contained
+[deployment bundle](deploy/README.md). It installs from this repository alone,
+keeps releases, configuration, and runtime state in documented system paths,
+and includes systemd units, optional fixed-domain ngrok ingress, Nginx templates,
+encrypted backup/restore, staged VM migration, and authenticated HTTP checks.
+
+The standalone mode can run on its own VM without another MCP repository. Shared
+Nginx mode emits only a route include, so this server can coexist with another
+application while retaining separate services, state, backups, and migration
+procedures. Use a fixed ingress domain for persistent remote connectors; quick
+tunnel URLs are not stable across restarts.
+
 ## OAuth Scopes
 
 You can limit the server's Gmail access by specifying OAuth scopes during authentication. This controls which tools are available to the LLM, reducing the attack surface for sensitive operations.
@@ -302,10 +340,11 @@ You can limit the server's Gmail access by specifying OAuth scopes during authen
 | Scope | Description |
 |-------|-------------|
 | `gmail.readonly` | Read-only access to emails (search, read, download attachments) |
-| `gmail.modify` | Full read/write access to emails (superset of `readonly` - includes sending, modifying, deleting) |
+| `gmail.modify` | Read/write mailbox access (superset of `readonly`; does not authorize permanent deletion) |
 | `gmail.compose` | Create drafts and send emails only |
 | `gmail.send` | Send emails only |
 | `gmail.labels` | Manage labels only |
+| `gmail.full` | Full mailbox access, including permanent deletion; opt in explicitly |
 | `gmail.settings.basic` | Manage filters and settings |
 
 > **Note**: `gmail.modify` is a superset that includes all read capabilities. You don't need `gmail.readonly` if you have `gmail.modify`.
@@ -321,7 +360,7 @@ node dist/index.js auth --scopes=gmail.readonly
 # Read-only with filter management
 node dist/index.js auth --scopes=gmail.readonly,gmail.settings.basic
 
-# Full access (default behavior)
+# Default read/write and settings access (no permanent deletion)
 node dist/index.js auth --scopes=gmail.modify,gmail.compose,gmail.send,gmail.settings.basic
 ```
 
@@ -337,9 +376,12 @@ The server automatically filters available tools based on your authorized scopes
 | `list_email_labels` | `gmail.readonly`, `gmail.modify`, or `gmail.labels` |
 | `send_email`, `draft_email`, `reply_all`, `send_draft` | `gmail.modify`, `gmail.compose`, or `gmail.send` |
 | `delete_draft`, `update_draft` | `gmail.modify` or `gmail.compose` |
-| `modify_email`, `delete_email`, `batch_modify_emails`, `batch_delete_emails`, `modify_thread`, `report_phishing`, `batch_report_phishing` | `gmail.modify` |
+| `modify_email`, `batch_modify_emails`, `modify_thread`, `report_phishing`, `batch_report_phishing` | `gmail.modify` |
+| `delete_email`, `batch_delete_emails` | `gmail.full` (`https://mail.google.com/`) |
 | `create_label`, `update_label`, `delete_label`, `get_or_create_label` | `gmail.modify` or `gmail.labels` |
 | `list_filters`, `get_filter`, `create_filter`, `delete_filter`, `create_filter_from_template` | `gmail.settings.basic` |
+
+`gmail.full` is intentionally separate from the default scopes because it grants permanent-delete capability. Prefer `modify_email` / `batch_modify_emails` for archive, mark-read, label, or inbox cleanup flows; re-authenticate with `--scopes=gmail.full,gmail.settings.basic` only when the assistant should be able to permanently delete mail. `gmail.full` is a superset of the other mail scopes, so that combination keeps every read/send/modify/label tool available (settings scopes remain separate - Gmail's filter endpoints only accept `gmail.settings.*`).
 
 ### Re-authenticating
 
@@ -395,15 +437,40 @@ node dist/index.js auth --scopes=gmail.modify,gmail.settings.basic
 }
 ```
 
-This enables all 23 tools including sending emails, managing labels, creating filters, reply-all, thread operations, phishing reports, and batch operations.
+This enables every tool covered by the default scopes. The two permanent-delete tools remain hidden unless the account is re-authenticated with `gmail.full`.
+
+### Running multiple instances (tool-name prefix)
+
+Some MCP clients dedupe tool entries by their base name across servers, which makes it impossible to run two instances of this server side-by-side (e.g. one for a personal account and one for a shared inbox) - only one instance's tools surface, even though both servers report as connected.
+
+The server accepts an optional `--tool-prefix=<value>` CLI flag (or `GMAIL_MCP_TOOL_PREFIX` env var) that is prepended to every tool name at registration. Default is empty (fully backward-compatible).
+
+Example: register two instances with distinct prefixes in Claude Code:
+
+```bash
+# Personal account
+claude mcp add gmail-personal -s user \
+  -e GMAIL_CREDENTIALS_PATH=$HOME/.gmail-mcp/credentials-personal.json \
+  -- node /absolute/path/to/Gmail-MCP-Server/dist/index.js --tool-prefix=personal_
+
+# Shared inbox
+claude mcp add gmail-info -s user \
+  -- node /absolute/path/to/Gmail-MCP-Server/dist/index.js --tool-prefix=info_
+```
+
+Tools then surface as `mcp__gmail-personal__personal_search_emails`, `mcp__gmail-info__info_search_emails`, etc. - distinct at every layer. When a prefix is configured, calls must use that prefix; hidden unprefixed or unknown names are rejected.
+
+The `auth` subcommand runs before the server starts and is unaffected - invoke it without `--tool-prefix`.
 
 ## Available Tools
 
 The server provides the following tools that can be used through Claude Desktop:
 
+File inputs are constrained to `${GMAIL_MCP_STATE_DIR:-~/.gmail-mcp}/files/imports` and `files/exports`. Relative attachment and inline-image paths resolve under `files/imports`; place files there before calling a send, draft, reply, or scheduling tool. Downloads are written under `files/exports`. A message may contain at most 10 combined attachment/inline MIME parts and 25 MiB of decoded file data.
+
 ### 1. Send Email (`send_email`)
 
-Sends a new email immediately. Supports plain text, HTML, or multipart emails **with optional file attachments**.
+Sends a new email immediately. Supports plain text, HTML, or multipart emails **with optional file attachments and inline images**.
 
 Basic Email:
 ```json
@@ -424,9 +491,9 @@ Basic Email:
   "subject": "Project Files",
   "body": "Hi,\n\nPlease find the project files attached.\n\nBest regards",
   "attachments": [
-    "/path/to/document.pdf",
-    "/path/to/spreadsheet.xlsx",
-    "/path/to/presentation.pptx"
+    "project/document.pdf",
+    "project/spreadsheet.xlsx",
+    "project/presentation.pptx"
   ]
 }
 ```
@@ -452,6 +519,22 @@ Multipart Email Example (HTML + Plain Text):
 }
 ```
 
+**Inline Images (embedded in HTML):**
+
+Embed images inside the HTML body so they render in place, instead of arriving as separate attachments. Reference each image from `htmlBody` by its `cid`, and supply it as a managed import `path` or strictly encoded base64 `content`. Works the same way on `draft_email`, `update_draft`, `reply_all`, and scheduled email. Base64 images are limited to 10 MiB each and 20 MiB combined.
+
+```json
+{
+  "to": ["recipient@example.com"],
+  "subject": "Quarterly Report",
+  "body": "Revenue is up. See the chart below.",
+  "htmlBody": "<p>Revenue is up:</p><img src=\"cid:chart1\">",
+  "inlineImages": [
+    { "cid": "chart1", "path": "charts/chart.png" }
+  ]
+}
+```
+
 ### 2. Draft Email (`draft_email`)
 Creates a draft email without sending it. **Also supports attachments**.
 
@@ -461,7 +544,7 @@ Creates a draft email without sending it. **Also supports attachments**.
   "subject": "Draft Report",
   "body": "Here's the draft report for your review.",
   "cc": ["manager@example.com"],
-  "attachments": ["/path/to/draft_report.docx"]
+  "attachments": ["drafts/draft_report.docx"]
 }
 ```
 
@@ -490,13 +573,13 @@ Attachments (2):
 ```
 
 ### 4. **Download Attachment (`download_attachment`)**
-**NEW**: Downloads email attachments to your local filesystem.
+Downloads email attachments into the managed export library.
 
 ```json
 {
   "messageId": "182ab45cd67ef",
   "attachmentId": "ANGjdJ9fkTs-i3GCQo5o97f_itG...",
-  "savePath": "/path/to/downloads",
+  "savePath": "downloads",
   "filename": "downloaded_document.pdf"
 }
 ```
@@ -504,7 +587,7 @@ Attachments (2):
 Parameters:
 - `messageId`: The ID of the email containing the attachment
 - `attachmentId`: The attachment ID (shown in enhanced email display)
-- `savePath`: Directory to save the file (optional, defaults to current directory)
+- `savePath`: Subdirectory under managed exports (optional; defaults to the export root)
 - `filename`: Custom filename (optional, uses original filename if not provided)
 
 ### 5. Search Emails (`search_emails`)
@@ -529,7 +612,7 @@ Adds or removes labels from emails (move to different folders, archive, etc.).
 ```
 
 ### 7. Delete Email (`delete_email`)
-Permanently deletes an email.
+Permanently deletes an email. This tool requires `gmail.full` (`https://mail.google.com/`); the default `gmail.modify` scope is not enough for Gmail's permanent-delete endpoint.
 
 ```json
 {
@@ -600,7 +683,7 @@ Modifies labels for multiple emails in efficient batches.
 ```
 
 ### 14. Batch Delete Emails (`batch_delete_emails`)
-Permanently deletes multiple emails in efficient batches.
+Permanently deletes multiple emails in efficient batches. This tool requires `gmail.full` (`https://mail.google.com/`); the default `gmail.modify` scope is not enough for Gmail's permanent-delete endpoint.
 
 ```json
 {
@@ -689,7 +772,7 @@ Replies to all recipients of an email. Automatically fetches the original email 
   "body": "Plain text fallback",
   "htmlBody": "<p>Thanks for the update. See attached notes.</p>",
   "mimeType": "multipart/alternative",
-  "attachments": ["/path/to/notes.pdf"]
+  "attachments": ["notes/meeting.pdf"]
 }
 ```
 
@@ -698,7 +781,7 @@ Parameters:
 - `body` (required): Reply body (plain text, or fallback when using multipart)
 - `htmlBody` (optional): HTML version of the reply body
 - `mimeType` (optional): `text/plain` (default), `text/html`, or `multipart/alternative`
-- `attachments` (optional): Array of file paths to attach
+- `attachments` (optional): Array of managed import paths to attach
 
 ### 21. Modify Thread (`modify_thread`)
 Atomically modifies labels on an entire thread (all messages at once). Solves the problem where archiving only the latest message leaves older messages in the inbox.
@@ -733,7 +816,7 @@ Reports multiple messages as phishing in efficient batches.
 ```
 
 ### 24. Send Draft (`send_draft`)
-Atomically sends an existing draft via `users.drafts.send` and removes it from the Drafts folder in the same operation — no orphan/ghost draft left behind. Use after a `draft_email` (or `update_draft`) once the content is confirmed.
+Atomically sends an existing draft via `users.drafts.send` and removes it from the Drafts folder in the same operation - no orphan/ghost draft left behind. Use after a `draft_email` (or `update_draft`) once the content is confirmed.
 
 ```json
 {
@@ -751,7 +834,7 @@ Replaces a draft's content in place via `users.drafts.update`, **preserving the 
   "subject": "Revised Report",
   "body": "Updated draft content.",
   "cc": ["manager@example.com"],
-  "attachments": ["/path/to/report.docx"]
+  "attachments": ["reports/revised.docx"]
 }
 ```
 
@@ -775,6 +858,23 @@ send_draft(draftId)          // atomic send + draft removal
 ```
 
 Or abort: `delete_draft(draftId)`.
+
+### 27-36. Thread, Export, Account, and Scheduling Tools
+
+| Tool | Purpose |
+|------|---------|
+| `get_thread` | Read all messages in one Gmail thread |
+| `list_inbox_threads` | List inbox threads without expanding every message |
+| `get_inbox_with_threads` | List and optionally expand inbox threads |
+| `download_email` | Export one message as JSON, EML, text, or HTML under managed exports |
+| `list_accounts` | List locally authenticated Gmail accounts |
+| `schedule_email` | Queue an email, including managed attachments/inline images, for the dedicated scheduler |
+| `list_scheduled_emails` | Inspect pending, sending, sent, failed, or uncertain queue records |
+| `cancel_scheduled_email` | Cancel a pending scheduled email and release its spool |
+| `resolve_uncertain_scheduled_email` | Record a verified sent/failed outcome after an indeterminate Gmail response |
+| `authenticate_account` | Start account-specific OAuth locally or through the remote callback |
+
+Run exactly one scheduler process with `node dist/index.js scheduler`; the Docker Compose and Ubuntu deployment bundles do this separately from the MCP server. A claimed send is never retried automatically after an uncertain result.
 
 ## Filter Management Features
 
@@ -967,9 +1067,9 @@ You can combine multiple operators: `from:john@example.com after:2024/01/01 has:
 
 The server provides comprehensive attachment functionality:
 
-- **Sending Attachments**: Include file paths in the `attachments` array when sending or drafting emails
+- **Sending Attachments**: Place files under managed imports and include their relative paths in the `attachments` array
 - **Attachment Detection**: Automatically detects MIME types and file sizes
-- **Download Capability**: Download any email attachment to your local filesystem
+- **Download Capability**: Download any email attachment into bounded managed exports
 - **Enhanced Display**: View detailed attachment information including filenames, types, sizes, and download IDs
 - **Multiple Formats**: Support for all common file types (documents, images, archives, etc.)
 - **RFC822 Compliance**: Uses Nodemailer for proper MIME message formatting
@@ -1027,7 +1127,9 @@ The server includes efficient batch processing capabilities:
 - Never share or commit your credentials to version control
 - Regularly review and revoke unused access in your Google Account settings
 - Credentials are stored globally but are only accessible by the current user
-- **Attachment files are processed locally and never stored permanently by the server**
+- Attachment and inline-image paths cannot escape managed imports/exports; links, special files, multiply linked files, and files that change during validation are rejected
+- Scheduled MIME parts are copied into bounded owner-specific spools; successful, failed, or cancelled records release those bytes, while uncertain records retain them temporarily for reconciliation
+- Remote MCP requests are capped at 32 MiB in both the application and supplied Nginx configuration
 
 ## Troubleshooting
 
@@ -1040,8 +1142,9 @@ The server includes efficient batch processing capabilities:
    - For web applications, verify the redirect URI is correctly configured
 
 3. **Port Already in Use**
-   - If port 3000 is already in use, please free it up before running authentication
-   - You can find and stop the process using that port
+   - By default authentication uses port 3000; either free it up before running authentication, or run on a different port by passing a custom callback URL (e.g. `node dist/index.js auth http://localhost:8080/oauth2callback`)
+   - If freeing port 3000, you can find and stop the process using that port
+   - A custom callback URL must match one of the authorized redirect URIs registered in the Google Cloud Console
 
 4. **Batch Operation Failures**
    - If batch operations fail, they automatically retry individual items
@@ -1049,10 +1152,10 @@ The server includes efficient batch processing capabilities:
    - Consider reducing the batch size if you encounter rate limiting
 
 5. **Attachment Issues**
-   - **File Not Found**: Ensure attachment file paths are correct and accessible
-   - **Permission Errors**: Check that the server has read access to attachment files
-   - **Size Limits**: Gmail has a 25MB attachment size limit per email
-   - **Download Failures**: Verify you have write permissions to the download directory
+   - **File Not Found**: Put source files under `${GMAIL_MCP_STATE_DIR:-~/.gmail-mcp}/files/imports` and use a relative managed path
+   - **Permission Errors**: Files must be plain, singly linked regular files readable by the service account
+   - **Size Limits**: A message supports at most 10 combined attachment/inline parts and 25 MiB decoded data
+   - **Download Failures**: Downloads are confined to the managed export library, which must be writable by the service account
 
 ## Contributing
 
@@ -1062,8 +1165,8 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 This repo uses a **two-branch model**:
 
-- **`main`** — stable. Only receives changes promoted from `experimental` after they're confirmed working. PRs are **never** merged directly into `main`.
-- **`experimental`** — staging / active development. All PRs are retargeted here and merged into `experimental` first.
+- **`main`** - stable. Only receives changes promoted from `experimental` after they're confirmed working. PRs are **never** merged directly into `main`.
+- **`experimental`** - staging / active development. All PRs are retargeted here and merged into `experimental` first.
 
 Lifecycle of a contribution:
 
@@ -1078,7 +1181,7 @@ PR opened (any base)
 
 Open your PR against `experimental` when possible. If you target `main`, a maintainer will retarget it to `experimental` before merge.
 
-**CI requires README updates** — every push to `main` and every PR must include a README.md change (even a version bump or changelog entry). This ensures documentation stays current as the codebase evolves.
+**CI requires README updates** - every push to `main` and every PR must include a README.md change (even a version bump or changelog entry). This ensures documentation stays current as the codebase evolves.
 
 To bypass for commits that genuinely don't need a docs update (dependency bumps, CI config changes), include `[skip-readme]` or `[no-readme]` in your commit message or PR title.
 

@@ -1,0 +1,85 @@
+name: Publish release
+
+# Publishes @artymclabin/gmail-mcp everywhere when a v* tag is pushed:
+# npm -> official MCP Registry (OIDC) -> Smithery (.mcpb bundle).
+# Secrets: SMITHERY_API_KEY. (npm needs none - see below.)
+#
+# 🚨 THE npm JOB NO LONGER USES A TOKEN (2026-08-12). It published with
+# NODE_AUTH_TOKEN: secrets.NPM_TOKEN, a long-lived credential that could publish
+# under this account from anywhere it leaked to - and npm is switching that off
+# for publishing in Jan 2027, so it was a dated mechanism as well as a standing
+# risk. npm now trusts THIS repository and THIS workflow file directly and the
+# runner mints a short-lived OIDC token per run, the same way the MCP Registry
+# job below already worked.
+#
+# 🚨 The trust is registered on npmjs.com against the exact filename
+# `publish.yml` and repo `ArtyMcLabin/Gmail-MCP-Server`. Renaming or moving this
+# file makes npm refuse the run. Change it in both places or not at all.
+# The NPM_TOKEN repository secret can now be deleted.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+  id-token: write # OIDC auth for the MCP Registry
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 24
+          registry-url: 'https://registry.npmjs.org'
+      # Trusted publishing needs npm >= 11.5.1; the runner image ships older, and
+      # an older npm falls back to looking for a token that no longer exists.
+      - run: npm install -g npm@latest
+      - run: npm ci
+      - run: npm test
+      - run: npm publish --access public
+
+  mcp-registry:
+    needs: npm
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+      - name: Authenticate to MCP Registry (OIDC)
+        run: ./mcp-publisher login github-oidc
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish
+
+  smithery:
+    needs: npm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run build
+      - name: Assemble .mcpb bundle
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          mkdir bundle
+          cp -r dist package.json README.md LICENSE bundle/
+          jq --arg v "$VERSION" '.version = $v' mcpb-manifest.json > bundle/manifest.json
+          cd bundle && npm install --omit=dev --ignore-scripts
+      - name: Pack bundle
+        run: |
+          npx --yes @anthropic-ai/mcpb validate bundle/manifest.json
+          npx --yes @anthropic-ai/mcpb pack bundle gmail-mcp.mcpb
+      - name: Publish to Smithery
+        run: |
+          npm install -g smithery@latest
+          smithery mcp publish ./gmail-mcp.mcpb -n rawceo/gmail-mcp
+        env:
+          SMITHERY_API_KEY: ${{ secrets.SMITHERY_API_KEY }}

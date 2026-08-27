@@ -1,0 +1,66 @@
+{
+  "manifest_version": "0.3",
+  "name": "gmail-mcp",
+  "display_name": "Gmail MCP Server",
+  "version": "2.0.0",
+  "description": "Lean Gmail MCP server with auto authentication support (maintained fork of GongRzhe/Gmail-MCP-Server)",
+  "long_description": "A Model Context Protocol server for Gmail: search, read, send, draft, label, filter, thread and attachment operations, with automatic Google OAuth authentication. Runs locally over stdio. Requires a Google Cloud OAuth client (gcp-oauth.keys.json); run the bundled server once with the `auth` argument (or place keys at ~/.gmail-mcp/gcp-oauth.keys.json) to complete authentication.",
+  "author": {
+    "name": "Arty McLabin",
+    "url": "https://github.com/ArtyMcLabin"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ArtyMcLabin/Gmail-MCP-Server"
+  },
+  "homepage": "https://github.com/ArtyMcLabin/Gmail-MCP-Server",
+  "documentation": "https://github.com/ArtyMcLabin/Gmail-MCP-Server#readme",
+  "support": "https://github.com/ArtyMcLabin/Gmail-MCP-Server/issues",
+  "keywords": [
+    "gmail",
+    "email",
+    "google",
+    "oauth",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/dist/index.js"
+      ],
+      "env": {
+        "GMAIL_OAUTH_PATH": "${user_config.gmail_oauth_path}",
+        "GMAIL_CREDENTIALS_PATH": "${user_config.gmail_credentials_path}"
+      }
+    }
+  },
+  "user_config": {
+    "gmail_oauth_path": {
+      "type": "file",
+      "title": "Google OAuth keys file (gcp-oauth.keys.json)",
+      "description": "Path to your Google Cloud OAuth client keys JSON. Optional - defaults to ~/.gmail-mcp/gcp-oauth.keys.json.",
+      "required": false
+    },
+    "gmail_credentials_path": {
+      "type": "file",
+      "title": "Stored Gmail credentials file",
+      "description": "Path where authenticated Gmail tokens are stored. Optional - defaults to ~/.gmail-mcp/credentials.json.",
+      "required": false
+    }
+  },
+  "compatibility": {
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
+    "runtimes": {
+      "node": ">=24.0.0"
+    }
+  }
+}

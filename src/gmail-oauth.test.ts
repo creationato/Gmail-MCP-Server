@@ -7,10 +7,13 @@ import {
     GmailCredentialsFile,
     GmailOAuthError,
     buildGmailAuthUrl,
+    attachGmailTokenPersistence,
     completeGmailOAuthCallback,
     consumePendingGmailOAuthState,
     createPendingGmailOAuthState,
     getGmailOAuthListenHost,
+    getLocalCallbackPort,
+    loadGmailCredentialsIntoClient,
     saveCredentialsFile,
     startRemoteGmailOAuthFlow,
     validateLocalOAuthCallbackState,
@@ -52,6 +55,138 @@ function writeOAuthKeys(): string {
 }
 
 describe('Gmail OAuth flow helpers', () => {
+    it('derives local callback ports without ignoring protocol defaults', () => {
+        expect(getLocalCallbackPort('http://localhost:8080/custom')).toBe(8080);
+        expect(getLocalCallbackPort('http://localhost/custom')).toBe(80);
+        expect(getLocalCallbackPort('https://gmail.example.test/custom')).toBe(3000);
+        expect(() => getLocalCallbackPort('ftp://localhost/custom')).toThrowError(
+            expect.objectContaining({ reason: 'invalid_listen_host' }),
+        );
+    });
+
+    it('persists an access-only refresh without dropping the refresh token or scopes', () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gmail-token-refresh-test-'));
+        const credentialsPath = path.join(directory, 'user@gmail.com.json');
+        fs.writeFileSync(credentialsPath, JSON.stringify({
+            tokens: {
+                access_token: 'old-access',
+                refresh_token: 'durable-refresh',
+                expiry_date: 1,
+            },
+            scopes: ['gmail.readonly'],
+        }), { mode: 0o600 });
+        const client = new OAuth2Client();
+
+        const loaded = loadGmailCredentialsIntoClient(client, credentialsPath);
+        client.emit('tokens', { access_token: 'new-access', expiry_date: 2 });
+
+        expect(loaded.scopes).toEqual(['gmail.readonly']);
+        expect(JSON.parse(fs.readFileSync(credentialsPath, 'utf8'))).toEqual({
+            tokens: {
+                access_token: 'new-access',
+                refresh_token: 'durable-refresh',
+                expiry_date: 2,
+            },
+            scopes: ['gmail.readonly'],
+        });
+    });
+
+    it('rejects every field from a client whose refresh-token generation is stale', () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gmail-token-stale-client-test-'));
+        const credentialsPath = path.join(directory, 'user@gmail.com.json');
+        fs.writeFileSync(credentialsPath, JSON.stringify({
+            tokens: {
+                access_token: 'access-r1',
+                refresh_token: 'refresh-r1',
+                expiry_date: 1,
+            },
+            scopes: ['gmail.readonly'],
+        }), { mode: 0o600 });
+        const staleClient = new OAuth2Client();
+        const rotatingClient = new OAuth2Client();
+        loadGmailCredentialsIntoClient(staleClient, credentialsPath);
+        loadGmailCredentialsIntoClient(rotatingClient, credentialsPath);
+
+        rotatingClient.emit('tokens', {
+            access_token: 'access-r2',
+            refresh_token: 'refresh-r2',
+            expiry_date: 2,
+            token_type: 'Bearer',
+        });
+        staleClient.emit('tokens', {
+            access_token: 'stale-access',
+            refresh_token: 'refresh-r1',
+            expiry_date: 999,
+            token_type: 'stale-type',
+        });
+
+        expect(JSON.parse(fs.readFileSync(credentialsPath, 'utf8'))).toEqual({
+            tokens: {
+                access_token: 'access-r2',
+                refresh_token: 'refresh-r2',
+                expiry_date: 2,
+                token_type: 'Bearer',
+            },
+            scopes: ['gmail.readonly'],
+        });
+    });
+
+    it('accepts sequential refresh-token rotations from the same client', () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gmail-token-sequential-test-'));
+        const credentialsPath = path.join(directory, 'user@gmail.com.json');
+        fs.writeFileSync(credentialsPath, JSON.stringify({
+            tokens: {
+                access_token: 'access-r1',
+                refresh_token: 'refresh-r1',
+                expiry_date: 1,
+            },
+            scopes: ['gmail.modify'],
+        }), { mode: 0o600 });
+        const client = new OAuth2Client();
+        loadGmailCredentialsIntoClient(client, credentialsPath);
+
+        client.emit('tokens', {
+            access_token: 'access-r2',
+            refresh_token: 'refresh-r2',
+            expiry_date: 2,
+        });
+        client.emit('tokens', {
+            access_token: 'access-r3',
+            refresh_token: 'refresh-r3',
+            expiry_date: 3,
+        });
+
+        expect(JSON.parse(fs.readFileSync(credentialsPath, 'utf8'))).toEqual({
+            tokens: {
+                access_token: 'access-r3',
+                refresh_token: 'refresh-r3',
+                expiry_date: 3,
+            },
+            scopes: ['gmail.modify'],
+        });
+    });
+
+    it('upgrades legacy token files and preserves fallback scopes when refreshed', () => {
+        const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gmail-token-legacy-test-'));
+        const credentialsPath = path.join(directory, 'credentials.json');
+        fs.writeFileSync(credentialsPath, JSON.stringify({
+            access_token: 'old-access',
+            refresh_token: 'legacy-refresh',
+        }), { mode: 0o600 });
+        const client = new OAuth2Client();
+
+        attachGmailTokenPersistence(client, credentialsPath, ['gmail.modify']);
+        client.emit('tokens', { access_token: 'new-access' });
+
+        expect(JSON.parse(fs.readFileSync(credentialsPath, 'utf8'))).toEqual({
+            tokens: {
+                access_token: 'new-access',
+                refresh_token: 'legacy-refresh',
+            },
+            scopes: ['gmail.modify'],
+        });
+    });
+
     it('validates the configurable local OAuth callback listen host', () => {
         expect(getGmailOAuthListenHost({})).toBe('127.0.0.1');
         expect(getGmailOAuthListenHost({ GMAIL_OAUTH_LISTEN_HOST: '0.0.0.0' })).toBe('0.0.0.0');

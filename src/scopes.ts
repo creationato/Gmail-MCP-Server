@@ -7,6 +7,7 @@
 //   - gmail.send: Send emails only
 //   - gmail.labels: Manage labels only
 //   - gmail.settings.basic: Manage filters and settings
+//   - gmail.full: Full mailbox access, including permanent deletion
 //
 // Note: gmail.modify includes all capabilities of gmail.readonly,
 // so you don't need both scopes together.
@@ -18,6 +19,7 @@ export const SCOPE_MAP: Record<string, string> = {
   "gmail.compose": "https://www.googleapis.com/auth/gmail.compose",
   "gmail.send": "https://www.googleapis.com/auth/gmail.send",
   "gmail.labels": "https://www.googleapis.com/auth/gmail.labels",
+  "gmail.full": "https://mail.google.com/",
   "gmail.settings.basic": "https://www.googleapis.com/auth/gmail.settings.basic",
   "gmail.settings.sharing": "https://www.googleapis.com/auth/gmail.settings.sharing",
 };
@@ -47,12 +49,27 @@ export function scopeNamesToUrls(scopes: string[]): string[] {
   return scopes.map(scopeNameToUrl);
 }
 
+// Scopes satisfied by gmail.full (https://mail.google.com/), which Google
+// treats as a superset of the mail scopes. It does NOT cover the settings
+// scopes — Gmail's settings endpoints only accept gmail.settings.* .
+const GMAIL_FULL_COVERS = new Set([
+  "gmail.readonly",
+  "gmail.modify",
+  "gmail.compose",
+  "gmail.send",
+  "gmail.labels",
+  "gmail.full",
+]);
+
 // Check if the authorized scopes grant access to a tool
 // Returns true if ANY of the tool's required scopes are present in authorizedScopes
 export function hasScope(authorizedScopes: string[], requiredScopes: string[]): boolean {
   // Normalize to shorthand names for comparison (handles both URL and shorthand input)
   const normalizedAuth = authorizedScopes.map(scopeUrlToName);
-  return requiredScopes.some(scope => normalizedAuth.includes(scope));
+  const hasFull = normalizedAuth.includes("gmail.full");
+  return requiredScopes.some(scope =>
+    normalizedAuth.includes(scope) || (hasFull && GMAIL_FULL_COVERS.has(scope))
+  );
 }
 
 // Parse scope input from CLI (comma-separated or space-separated)

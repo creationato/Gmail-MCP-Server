@@ -1,27 +1,34 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.ArtyMcLabin/Gmail-MCP-Server",
-  "description": "Gmail MCP server with auto authentication support",
+  "description": "Lean Gmail MCP server with auto authentication support",
   "repository": {
     "url": "https://github.com/ArtyMcLabin/Gmail-MCP-Server",
     "source": "github"
   },
-  "version": "1.0.0",
+  "version": "2.0.0",
   "packages": [
     {
       "registryType": "npm",
-      "identifier": "@gongrzhe/server-gmail-autoauth-mcp",
-      "version": "1.0.0",
+      "identifier": "@artymclabin/gmail-mcp",
+      "version": "2.0.0",
       "transport": {
         "type": "stdio"
       },
       "environmentVariables": [
         {
-          "description": "Your API key for the service",
-          "isRequired": true,
+          "description": "Optional override for the OAuth client keys file path (defaults to ~/.gmail-mcp/gcp-oauth.keys.json)",
+          "isRequired": false,
           "format": "string",
-          "isSecret": true,
-          "name": "YOUR_API_KEY"
+          "isSecret": false,
+          "name": "GMAIL_OAUTH_PATH"
+        },
+        {
+          "description": "Optional override for the stored credentials file path (defaults to ~/.gmail-mcp/credentials.json)",
+          "isRequired": false,
+          "format": "string",
+          "isSecret": false,
+          "name": "GMAIL_CREDENTIALS_PATH"
         }
       ]
     }

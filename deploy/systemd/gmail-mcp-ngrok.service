@@ -1,0 +1,45 @@
+[Unit]
+Description=Fixed ngrok ingress for Gmail MCP
+Documentation=file:/opt/gmail-mcp/current/deploy/README.md
+Wants=network-online.target
+After=network-online.target gmail-mcp.service
+ConditionPathExists=/etc/gmail-mcp/ngrok.env
+ConditionPathExists=/var/lib/gmail-mcp-deploy/run-authorized.env
+ConditionPathExists=!/var/lib/gmail-mcp-deploy/migration-fence.env
+
+[Service]
+Type=simple
+User=gmail-mcp-ingress
+Group=gmail-mcp-ingress
+EnvironmentFile=/etc/gmail-mcp/ngrok.env
+Environment=HOME=/var/lib/gmail-mcp-ingress
+WorkingDirectory=/var/lib/gmail-mcp-ingress
+ExecStartPre=+/usr/bin/python3 -I /opt/gmail-mcp/current/deploy/lib/envfile.py validate --profile ngrok --config-dir /etc/gmail-mcp --state-dir /var/lib/gmail-mcp --require-owner-uid 0 --require-mode 0600 --require-single-link /etc/gmail-mcp/ngrok.env
+ExecStart=/opt/gmail-mcp/current/deploy/bin/run-ngrok.sh
+Restart=always
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/gmail-mcp /opt/gmail-mcp
+ReadWritePaths=/var/lib/gmail-mcp-ingress
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

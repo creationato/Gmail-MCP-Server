@@ -6,7 +6,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 
 const stateDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'gmail-mcp-stdio-test-'));
-const child = spawn(process.execPath, ['dist/index.js'], {
+const child = spawn(process.execPath, ['dist/index.js', '--tool-prefix=stdio_'], {
     cwd: process.cwd(),
     env: {
         ...process.env,
@@ -67,15 +67,23 @@ try {
         clientInfo: { name: 'gmail-mcp-stdio-test', version: '1.0.0' },
     });
     assert.equal(initialize.result.serverInfo.name, 'gmail');
+    assert.equal(initialize.result.serverInfo.version, '2.0.0');
     child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`);
 
     const listTools = await request(2, 'tools/list');
-    assert.ok(listTools.result.tools.some(tool => tool.name === 'list_accounts'));
+    assert.ok(listTools.result.tools.some(tool => tool.name === 'stdio_list_accounts'));
+    assert.ok(!listTools.result.tools.some(tool => tool.name === 'list_accounts'));
     const listAccounts = await request(3, 'tools/call', {
-        name: 'list_accounts',
+        name: 'stdio_list_accounts',
         arguments: {},
     });
     assert.match(listAccounts.result.content[0].text, /"accounts"/);
+    const hiddenUnprefixedCall = await request(4, 'tools/call', {
+        name: 'list_accounts',
+        arguments: {},
+    });
+    assert.equal(hiddenUnprefixedCall.result.isError, true);
+    assert.match(hiddenUnprefixedCall.result.content[0].text, /not found/);
     console.log('Stdio server process test passed.');
 } finally {
     child.stdin.end();

@@ -1,6 +1,6 @@
 import nodemailer from 'nodemailer';
 import {
-    loadManagedAttachments,
+    prepareEmailMimeParts,
     type PreparedEmailAttachment,
 } from './managed-files.js';
 
@@ -117,7 +117,7 @@ export function createEmailMessage(validatedArgs: any): string {
 
 export async function createEmailWithNodemailer(
     validatedArgs: any,
-    preparedAttachments?: PreparedEmailAttachment[],
+    preparedParts?: PreparedEmailAttachment[],
 ): Promise<string> {
     // Validate email addresses
     (validatedArgs.to as string[]).forEach(email => {
@@ -125,6 +125,9 @@ export async function createEmailWithNodemailer(
             throw new Error(`Recipient email address is invalid: ${email}`);
         }
     });
+    if ((validatedArgs.inlineImages?.length ?? 0) > 0 && !validatedArgs.htmlBody) {
+        throw new Error('inlineImages require htmlBody because cid references resolve only from HTML content.');
+    }
 
     // Create a nodemailer transporter (we won't actually send, just generate the message)
     const transporter = nodemailer.createTransport({
@@ -133,8 +136,21 @@ export async function createEmailWithNodemailer(
         buffer: true
     });
 
-    // Read through the managed-file boundary before handing bytes to Nodemailer.
-    const attachments = preparedAttachments ?? loadManagedAttachments(validatedArgs.attachments ?? []);
+    // Resolve every source through the managed-file boundary and give Nodemailer
+    // only immutable buffers. Scheduled sends supply already verified spool bytes.
+    const prepared = preparedParts ?? prepareEmailMimeParts(
+        validatedArgs.attachments ?? [],
+        validatedArgs.inlineImages ?? [],
+    );
+    if (prepared.some(part => part.cid) && !validatedArgs.htmlBody) {
+        throw new Error('inlineImages require htmlBody because cid references resolve only from HTML content.');
+    }
+    const attachments = prepared.map(part => ({
+        filename: part.filename,
+        content: part.content,
+        ...(part.cid ? { cid: part.cid } : {}),
+        ...(part.contentType ? { contentType: part.contentType } : {}),
+    }));
 
     const mailOptions = {
         from: validatedArgs.from || 'me', // Gmail API uses default send-as if 'me', or specified alias
@@ -152,6 +168,17 @@ export async function createEmailWithNodemailer(
     // Generate the raw message
     const info = await transporter.sendMail(mailOptions);
     const rawMessage = info.message.toString();
-    
+
     return rawMessage;
+}
+/**
+ * Decide which email builder to use. Messages carrying file attachments or
+ * inline images need the nodemailer-based raw builder (multipart/mixed and
+ * multipart/related); plain or simple HTML mail uses the lightweight
+ * createEmailMessage() builder.
+ */
+export function needsRawBuilder(args: any): boolean {
+    const hasAttachments = Array.isArray(args?.attachments) && args.attachments.length > 0;
+    const hasInlineImages = Array.isArray(args?.inlineImages) && args.inlineImages.length > 0;
+    return hasAttachments || hasInlineImages;
 }
