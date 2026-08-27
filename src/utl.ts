@@ -1,7 +1,8 @@
-import fs from 'fs';
-import path from 'path';
-import { lookup as mimeLookup } from 'mime-types';
 import nodemailer from 'nodemailer';
+import {
+    loadManagedAttachments,
+    type PreparedEmailAttachment,
+} from './managed-files.js';
 
 /**
  * Helper function to encode email headers containing non-ASCII characters
@@ -114,7 +115,10 @@ export function createEmailMessage(validatedArgs: any): string {
 }
 
 
-export async function createEmailWithNodemailer(validatedArgs: any): Promise<string> {
+export async function createEmailWithNodemailer(
+    validatedArgs: any,
+    preparedAttachments?: PreparedEmailAttachment[],
+): Promise<string> {
     // Validate email addresses
     (validatedArgs.to as string[]).forEach(email => {
         if (!validateEmail(email)) {
@@ -129,20 +133,8 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
         buffer: true
     });
 
-    // Prepare attachments for nodemailer
-    const attachments = [];
-    for (const filePath of validatedArgs.attachments) {
-        if (!fs.existsSync(filePath)) {
-            throw new Error(`File does not exist: ${filePath}`);
-        }
-        
-        const fileName = path.basename(filePath);
-        
-        attachments.push({
-            filename: fileName,
-            path: filePath
-        });
-    }
+    // Read through the managed-file boundary before handing bytes to Nodemailer.
+    const attachments = preparedAttachments ?? loadManagedAttachments(validatedArgs.attachments ?? []);
 
     const mailOptions = {
         from: validatedArgs.from || 'me', // Gmail API uses default send-as if 'me', or specified alias
@@ -152,7 +144,7 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
         subject: validatedArgs.subject,
         text: validatedArgs.body,
         html: validatedArgs.htmlBody,
-        attachments: attachments,
+        attachments,
         inReplyTo: validatedArgs.inReplyTo,
         references: validatedArgs.references || validatedArgs.inReplyTo
     };
@@ -163,4 +155,3 @@ export async function createEmailWithNodemailer(validatedArgs: any): Promise<str
     
     return rawMessage;
 }
-

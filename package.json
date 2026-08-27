@@ -1,6 +1,6 @@
 {
   "name": "@gongrzhe/server-gmail-autoauth-mcp",
-  "version": "1.1.11",
+  "version": "2.0.0",
   "description": "Gmail MCP server with auto authentication support",
   "type": "module",
   "main": "dist/index.js",
@@ -13,6 +13,7 @@
     "start": "node dist/index.js",
     "auth": "node dist/index.js auth",
     "test": "vitest run",
+    "test:process": "npm run build && node test/remote-server-process.mjs && node test/stdio-server-process.mjs",
     "test:watch": "vitest",
     "lockfile:lint": "lockfile-lint --path package-lock.json --type npm --validate-https --allowed-hosts npm",
     "prepare": "npm run build",
@@ -47,28 +48,29 @@
     "access": "public"
   },
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=24.0.0"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@googleapis/gmail": "^18.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "email-addresses": "^5.0.0",
     "express": "^5.2.1",
-    "google-auth-library": "^9.4.1",
-    "googleapis": "^129.0.0",
+    "google-auth-library": "^10.5.0",
     "mime-types": "^3.0.1",
-    "nodemailer": "^7.0.11",
-    "open": "^10.0.0",
-    "zod": "^3.22.4",
-    "zod-to-json-schema": "^3.22.1"
+    "nodemailer": "^9.0.5",
+    "open": "^11.0.1",
+    "zod": "^3.25.76",
+    "zod-to-json-schema": "^3.25.2"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
-    "@types/mime-types": "^2.1.4",
-    "@types/node": "^20.10.5",
-    "@types/nodemailer": "^6.4.17",
-    "lockfile-lint": "^5.0.0",
+    "@types/mime-types": "^3.0.1",
+    "@types/node": "^24.13.3",
+    "@types/nodemailer": "^8.0.1",
+    "esbuild": "^0.28.2",
+    "lockfile-lint": "^5.0.1",
     "mcp-evals": "^1.0.18",
-    "typescript": "^5.3.3",
-    "vitest": "^4.0.18"
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.11"
   }
 }

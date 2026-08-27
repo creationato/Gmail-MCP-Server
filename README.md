@@ -72,6 +72,9 @@ A Model Context Protocol (MCP) server for Gmail integration in Claude Desktop wi
 
 ### Installing from this fork
 
+Node.js 24 or newer is required because the persistent remote OAuth state uses
+the built-in `node:sqlite` module.
+
 ```bash
 git clone https://github.com/ArtyMcLabin/Gmail-MCP-Server.git
 cd Gmail-MCP-Server
@@ -97,7 +100,7 @@ npm run build
       - Give it a name and click "Create"
       - For Web application, add the callback URL you will use:
         - Local auth: `http://localhost:3000/oauth2callback`
-        - Remote MCP auth: your public URL plus `/oauth2callback`, e.g. `https://hansen-writes-byte-sticks.trycloudflare.com/oauth2callback`
+        - Remote MCP auth: your fixed public URL plus `/oauth2callback`, e.g. `https://mcp.example.com/oauth2callback`
       - Download the JSON file of your client's OAuth keys
       - Rename the key file to `gcp-oauth.keys.json`
 
@@ -150,16 +153,43 @@ npm run build
 
 ### Docker Support
 
-If you prefer using Docker:
+The image uses Node.js 24, runs as an unprivileged user, and keeps mutable state
+under `/var/lib/gmail-mcp`.
+
+For a durable remote HTTP deployment, Compose starts the server on loopback port
+8080, persists state and configuration in named volumes, and stages the Google
+OAuth JSON with mode `0640` before the unprivileged server starts:
+
+```bash
+oauth_keys="$(realpath /path/to/gcp-oauth.keys.json)"
+api_key="$(openssl rand -hex 32)"
+umask 077
+cat >.env <<EOF
+GMAIL_OAUTH_KEYS_PATH=${oauth_keys}
+GMAIL_MCP_PUBLIC_ORIGIN=https://mcp.example.com
+GMAIL_MCP_BASE_PATH=
+GMAIL_MCP_API_KEY=${api_key}
+GMAIL_MCP_OAUTH_CALLBACKS=https://claude.ai/api/mcp/auth_callback
+GMAIL_MCP_BIND_ADDRESS=127.0.0.1
+GMAIL_MCP_HTTP_PORT=8080
+EOF
+docker compose up --detach --build
+docker compose ps
+```
+
+The MCP endpoint is `https://mcp.example.com/mcp`; put a TLS reverse proxy in
+front of the loopback listener. Re-running `docker compose up --detach` copies
+an updated OAuth JSON into the configuration volume. `docker compose down`
+preserves both volumes; adding `--volumes` deletes credentials, connector OAuth
+state, and the staged Google OAuth configuration.
 
 1. Authentication:
 ```bash
 docker run -i --rm \
-  --mount type=bind,source=/path/to/gcp-oauth.keys.json,target=/gcp-oauth.keys.json \
-  -v mcp-gmail:/gmail-server \
-  -e GMAIL_OAUTH_PATH=/gcp-oauth.keys.json \
-  -e "GMAIL_CREDENTIALS_PATH=/gmail-server/credentials.json" \
-  -p 3000:3000 \
+  --mount type=bind,source=/path/to/gcp-oauth.keys.json,target=/etc/gmail-mcp/gcp-oauth.keys.json,readonly \
+  -v mcp-gmail:/var/lib/gmail-mcp \
+  -e GMAIL_OAUTH_LISTEN_HOST=0.0.0.0 \
+  -p 127.0.0.1:3000:3000 \
   mcp/gmail auth
 ```
 
@@ -174,14 +204,28 @@ docker run -i --rm \
         "-i",
         "--rm",
         "-v",
-        "mcp-gmail:/gmail-server",
-        "-e",
-        "GMAIL_CREDENTIALS_PATH=/gmail-server/credentials.json",
+        "mcp-gmail:/var/lib/gmail-mcp",
+        "--mount",
+        "type=bind,source=/path/to/gcp-oauth.keys.json,target=/etc/gmail-mcp/gcp-oauth.keys.json,readonly",
         "mcp/gmail"
       ]
     }
   }
 }
+```
+
+The image defaults to stdio. For remote Streamable HTTP, provide the explicit
+HTTP command and required front-door OAuth settings:
+
+```bash
+docker run --rm \
+  -p 127.0.0.1:8080:8080 \
+  -v mcp-gmail:/var/lib/gmail-mcp \
+  --mount type=bind,source=/path/to/gcp-oauth.keys.json,target=/etc/gmail-mcp/gcp-oauth.keys.json,readonly \
+  -e GMAIL_MCP_PUBLIC_ORIGIN=https://mcp.example.com \
+  -e GMAIL_MCP_API_KEY="$(openssl rand -hex 32)" \
+  -e GMAIL_MCP_OAUTH_CALLBACKS=https://claude.ai/api/mcp/auth_callback \
+  mcp/gmail --http --host=0.0.0.0 --port=8080
 ```
 
 ### Cloud Server Authentication
@@ -209,7 +253,29 @@ node dist/index.js auth https://gmail.gongrzhe.com/oauth2callback
    node dist/index.js auth https://gmail.gongrzhe.com/oauth2callback
    ```
 
-For a remote MCP server used from Claude/Cowork, place a Web application OAuth JSON at `~/.gmail-mcp/gcp-oauth.keys.json`, set `GMAIL_MCP_PUBLIC_URL` or `MCP_PUBLIC_URL` to the public base URL if your proxy headers are not reliable, and add that exact public `/oauth2callback` URL in Google Cloud. Then call the `authenticate_account` MCP tool; it returns a Google authorization URL and the server handles `GET /oauth2callback` when Google redirects back.
+For a remote MCP server used from Claude/Cowork, place a Web application OAuth JSON in the state directory and configure the public endpoint explicitly:
+
+```bash
+export GMAIL_MCP_STATE_DIR="$HOME/.gmail-mcp"
+export GMAIL_MCP_PUBLIC_ORIGIN="https://mcp.example.com"
+export GMAIL_MCP_BASE_PATH=""  # Use a prefix such as /gmail when sharing a hostname.
+export GMAIL_MCP_API_KEY="replace-with-a-long-random-secret"
+export GMAIL_MCP_OAUTH_CALLBACKS="https://claude.ai/api/mcp/auth_callback"
+node dist/index.js --http --host=127.0.0.1 --port=8080
+```
+
+Version 2 uses MCP Streamable HTTP at `/mcp`. The former `--sse` command-line
+flag remains as a deprecated alias for `--http`, but the legacy `/sse` and
+`/messages` endpoints return HTTP 410. Existing remote connectors must be
+reconfigured to use `${GMAIL_MCP_PUBLIC_ORIGIN}${GMAIL_MCP_BASE_PATH}/mcp`.
+
+Remote mode fails closed if the public origin, API key, or redirect allowlist is missing. The API key is accepted only by the browser authorization form; MCP requests require issued OAuth access tokens. Connector clients, authorization codes, hashed tokens, and pending Google callbacks persist in `state.sqlite3` under `GMAIL_MCP_STATE_DIR`. Dynamic registrations are deduplicated, size/rate/capacity bounded, and expired; refresh tokens rotate with replay-family revocation and an OAuth revocation endpoint.
+
+Scheduled email queue changes are locked across processes and replaced atomically. The scheduler durably claims a message before calling Gmail. If the process stops or Gmail's response is indeterminate, the record becomes `uncertain` and is never sent again automatically; inspect that status before deciding on any manual retry.
+
+`GMAIL_MCP_PUBLIC_URL` remains supported for compatibility and may contain the complete MCP URL, such as `https://mcp.example.com/gmail/mcp`. With the new settings, the equivalent configuration is `GMAIL_MCP_PUBLIC_ORIGIN=https://mcp.example.com` and `GMAIL_MCP_BASE_PATH=/gmail`.
+
+Add `${GMAIL_MCP_PUBLIC_ORIGIN}${GMAIL_MCP_BASE_PATH}/oauth2callback` to the authorized redirect URIs of the Google Web OAuth client. Then call the `authenticate_account` MCP tool; it returns a Google authorization URL and the server handles the callback at that exact path.
 
 5. **Configure in your application:**
    ```json

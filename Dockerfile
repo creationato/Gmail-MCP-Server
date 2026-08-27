@@ -1,27 +1,35 @@
-FROM node:20-slim
+FROM node:24-bookworm-slim AS build
 
 WORKDIR /app
-
-# Copy package files
-COPY package.json package-lock.json* ./
-
-# Copy source files and config first
-COPY tsconfig.json ./
+COPY package.json package-lock.json tsconfig.json ./
+RUN npm ci --ignore-scripts --no-audit
 COPY src ./src
+RUN npm run build \
+    && npm prune --omit=dev --ignore-scripts --no-audit \
+    && npm audit --omit=dev --audit-level=high
 
-# Install dependencies (which will trigger build via prepare script)
-RUN npm ci
+FROM node:24-bookworm-slim AS runtime
 
-# Create directory for credentials and config
-RUN mkdir -p /gmail-server /root/.gmail-mcp
+ENV NODE_ENV=production \
+    GMAIL_MCP_STATE_DIR=/var/lib/gmail-mcp \
+    GMAIL_OAUTH_PATH=/etc/gmail-mcp/gcp-oauth.keys.json \
+    GMAIL_CREDENTIALS_PATH=/var/lib/gmail-mcp/credentials.json
 
-# Set environment variables
-ENV NODE_ENV=production
-ENV GMAIL_CREDENTIALS_PATH=/gmail-server/credentials.json
-ENV GMAIL_OAUTH_PATH=/root/.gmail-mcp/gcp-oauth.keys.json
+RUN groupadd --system --gid 10001 gmail-mcp \
+    && useradd --system --uid 10001 --gid gmail-mcp \
+        --home-dir /var/lib/gmail-mcp --shell /usr/sbin/nologin gmail-mcp \
+    && install -d -o gmail-mcp -g gmail-mcp -m 0700 /var/lib/gmail-mcp \
+    && install -d -o root -g gmail-mcp -m 0750 /etc/gmail-mcp
 
-# Expose port for OAuth flow
+WORKDIR /app
+COPY --from=build --chown=root:root /app/package.json /app/package-lock.json ./
+COPY --from=build --chown=root:root /app/node_modules ./node_modules
+COPY --from=build --chown=root:root /app/dist ./dist
+
+USER gmail-mcp
+VOLUME ["/var/lib/gmail-mcp", "/etc/gmail-mcp"]
+EXPOSE 8080
 EXPOSE 3000
 
-# Set entrypoint command
 ENTRYPOINT ["node", "dist/index.js"]
+CMD []

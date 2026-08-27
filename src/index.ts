@@ -2,24 +2,29 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import express from "express";
 import {
     CallToolRequestSchema,
     ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { google } from 'googleapis';
+import { gmail as createGmailClient } from '@googleapis/gmail';
 import { OAuth2Client } from 'google-auth-library';
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import type { Server as HttpServer } from 'node:http';
 import {createEmailMessage, createEmailWithNodemailer} from "./utl.js";
+import {
+    loadScheduledAttachments,
+    MAX_MANAGED_EXPORT_FILE_BYTES,
+    safeSuggestedFilename,
+    validateManagedExportFilename,
+    writeManagedExportFile,
+} from './managed-files.js';
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
 import { DEFAULT_SCOPES, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ScheduleEmailSchema, ListScheduledEmailsSchema, CancelScheduledEmailSchema, AuthenticateAccountSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ScheduleEmailSchema, ListScheduledEmailsSchema, CancelScheduledEmailSchema, ResolveUncertainScheduledEmailSchema, AuthenticateAccountSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import {
     CREDENTIALS_PATH,
@@ -38,11 +43,22 @@ import {
     listAuthenticatedAccounts,
     isAccountAuthenticated,
     getAccountCredentialsPath,
+    canonicalizeAccountEmail,
     loadQueue,
-    saveQueue,
+    enqueueScheduledEmail,
+    cancelScheduledEmail,
+    claimScheduledEmail,
+    markScheduledEmailFailed,
+    markScheduledEmailSent,
+    markScheduledEmailUncertain,
+    recoverInterruptedScheduledEmails,
+    resolveUncertainScheduledEmail,
+    acquireSchedulerLease,
     ensureDirectories,
     ScheduledEmail
 } from "./db.js";
+import { closeDefaultOAuthStateStore, getDefaultOAuthStateStore } from './oauth-store.js';
+import { createRemoteHttpApp, loadRemoteServerConfig } from './remote-http.js';
 
 
 // Dynamically resolve account credentials
@@ -83,7 +99,7 @@ async function getAccountClient(accountEmail?: string): Promise<{ gmail: any; au
         throw new Error(`Credentials file not found at ${credPath}`);
     }
 
-    const gmail = google.gmail({ version: 'v1', auth: oauthClient });
+    const gmail = createGmailClient({ version: 'v1', auth: oauthClient });
     return { gmail, authorizedScopes: scopes, oauthClient };
 }
 
@@ -111,91 +127,177 @@ function parseScheduledTime(timeStr: string): string {
 }
 
 async function startSchedulerDaemon() {
-    console.log('Starting Gmail MCP Scheduler Daemon...');
-    ensureDirectories();
-    
-    while (true) {
-        try {
-            const queue = loadQueue();
-            const now = new Date();
-            const pending = queue.filter(item => item.status === 'pending' && new Date(item.scheduledTime) <= now);
-            
-            if (pending.length > 0) {
-                console.log(`Found ${pending.length} pending scheduled emails to send.`);
-                
-                for (const email of pending) {
-                    const jitter = Math.floor(Math.random() * 40000) + 5000;
-                    console.log(`Scheduling send for email ID ${email.id} from ${email.account} with random organic jitter of ${Math.round(jitter/1000)}s...`);
-                    await new Promise(resolve => setTimeout(resolve, jitter));
-                    
-                    try {
-                        const { gmail } = await getAccountClient(email.account);
-                        console.log(`Sending email ${email.id} using account ${email.account}...`);
-                        
-                        let rawMessage;
-                        if (email.attachments && email.attachments.length > 0) {
-                            rawMessage = await createEmailWithNodemailer({
-                                to: email.to,
-                                subject: email.subject,
-                                body: email.body,
-                                htmlBody: email.htmlBody,
-                                cc: email.cc,
-                                bcc: email.bcc,
-                                threadId: email.threadId,
-                                inReplyTo: email.inReplyTo,
-                                attachments: email.attachments
-                            });
-                        } else {
-                            rawMessage = createEmailMessage({
-                                to: email.to,
-                                subject: email.subject,
-                                body: email.body,
-                                htmlBody: email.htmlBody,
-                                cc: email.cc,
-                                bcc: email.bcc,
-                                threadId: email.threadId,
-                                inReplyTo: email.inReplyTo
-                            });
-                        }
-                        
-                        const encodedMessage = Buffer.from(rawMessage).toString('base64')
-                            .replace(/\+/g, '-')
-                            .replace(/\//g, '_')
-                            .replace(/=+$/, '');
-                            
-                        const result = await gmail.users.messages.send({
-                            userId: 'me',
-                            requestBody: {
-                                raw: encodedMessage,
-                                ...(email.threadId && { threadId: email.threadId })
-                            }
-                        });
-                        
-                        email.status = 'sent';
-                        email.actualSentTime = new Date().toISOString();
-                        email.attempts++;
-                        console.log(`Successfully sent email ID ${email.id}! Gmail Message ID: ${result.data.id}`);
-                    } catch (sendError) {
-                        email.attempts++;
-                        console.error(`Failed to send email ID ${email.id} (Attempt ${email.attempts}):`, (sendError as any).message);
-                        
-                        if (email.attempts >= 3) {
-                            email.status = 'failed';
-                            email.errorMessage = (sendError as any).message;
-                        }
-                    }
-                    
-                    saveQueue(queue);
-                }
-            }
-        } catch (loopError) {
-            console.error('Error in scheduler loop iteration:', (loopError as any).message);
+    const lease = acquireSchedulerLease(CONFIG_DIR);
+    try {
+        console.log('Starting Gmail MCP Scheduler Daemon...');
+        ensureDirectories();
+
+        const interruptedCount = recoverInterruptedScheduledEmails();
+        if (interruptedCount > 0) {
+            console.error(
+                `Marked ${interruptedCount} interrupted scheduled email(s) as uncertain; they will not be sent again automatically.`,
+            );
         }
-        
-        const checkSleep = Math.floor(50000 + Math.random() * 20000);
-        console.log(`Scheduler sleeping for ${Math.round(checkSleep/1000)} seconds before next queue check...`);
-        await new Promise(resolve => setTimeout(resolve, checkSleep));
+
+        while (true) {
+        const now = new Date();
+        const pending = loadQueue().filter(
+            item => item.status === 'pending' && new Date(item.scheduledTime) <= now,
+        );
+
+        if (pending.length > 0) {
+            console.log(`Found ${pending.length} pending scheduled emails to send.`);
+
+            for (const candidate of pending) {
+                const jitter = Math.floor(Math.random() * 40000) + 5000;
+                console.log(`Scheduling send for email ID ${candidate.id} from ${candidate.account} with random organic jitter of ${Math.round(jitter/1000)}s...`);
+                await new Promise(resolve => setTimeout(resolve, jitter));
+
+                const email = claimScheduledEmail(candidate.id);
+                if (!email) continue;
+
+                let gmail: any;
+                let encodedMessage: string;
+                try {
+                    ({ gmail } = await getAccountClient(email.account));
+                    const rawMessage = email.attachments && email.attachments.length > 0
+                        ? await createEmailWithNodemailer({
+                            to: email.to,
+                            subject: email.subject,
+                            body: email.body,
+                            htmlBody: email.htmlBody,
+                            cc: email.cc,
+                            bcc: email.bcc,
+                            threadId: email.threadId,
+                            inReplyTo: email.inReplyTo,
+                        }, loadScheduledAttachments(email.id, email.attachments, CONFIG_DIR))
+                        : createEmailMessage({
+                            to: email.to,
+                            subject: email.subject,
+                            body: email.body,
+                            htmlBody: email.htmlBody,
+                            cc: email.cc,
+                            bcc: email.bcc,
+                            threadId: email.threadId,
+                            inReplyTo: email.inReplyTo,
+                        });
+                    encodedMessage = Buffer.from(rawMessage).toString('base64')
+                        .replace(/\+/g, '-')
+                        .replace(/\//g, '_')
+                        .replace(/=+$/, '');
+                } catch (preflightError) {
+                    const message = (preflightError as Error).message;
+                    markScheduledEmailFailed(email.id, message);
+                    console.error(`Scheduled email ${email.id} failed before Gmail send:`, message);
+                    continue;
+                }
+
+                console.log(`Sending email ${email.id} using account ${email.account}...`);
+                let result: any;
+                try {
+                    result = await gmail.users.messages.send({
+                        userId: 'me',
+                        requestBody: {
+                            raw: encodedMessage,
+                            ...(email.threadId && { threadId: email.threadId }),
+                        },
+                    });
+                } catch (sendError) {
+                    const message = (sendError as Error).message;
+                    markScheduledEmailUncertain(
+                        email.id,
+                        `Gmail send did not return a definitive result: ${message}`,
+                    );
+                    console.error(
+                        `Delivery outcome for scheduled email ${email.id} is uncertain; it will not be retried automatically:`,
+                        message,
+                    );
+                    continue;
+                }
+
+                markScheduledEmailSent(email.id, result.data.id);
+                console.log(`Successfully sent email ID ${email.id}! Gmail Message ID: ${result.data.id}`);
+            }
+        }
+
+            const checkSleep = Math.floor(50000 + Math.random() * 20000);
+            console.log(`Scheduler sleeping for ${Math.round(checkSleep/1000)} seconds before next queue check...`);
+            await new Promise(resolve => setTimeout(resolve, checkSleep));
+        }
+    } finally {
+        lease.release();
     }
+}
+
+const DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+function getHttpShutdownTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+    const configured = env.GMAIL_MCP_SHUTDOWN_TIMEOUT_MS?.trim();
+    if (!configured) return DEFAULT_HTTP_SHUTDOWN_TIMEOUT_MS;
+    const milliseconds = Number(configured);
+    if (!Number.isInteger(milliseconds) || milliseconds < 1 || milliseconds > 300_000) {
+        throw new Error('GMAIL_MCP_SHUTDOWN_TIMEOUT_MS must be an integer from 1 to 300000.');
+    }
+    return milliseconds;
+}
+
+function installGracefulHttpShutdown(
+    listener: HttpServer,
+    closeResources: () => void,
+    timeoutMs = getHttpShutdownTimeoutMs(),
+): void {
+    let shutdownStarted = false;
+    let shutdownFinished = false;
+    let resourcesClosed = false;
+
+    const closeResourcesOnce = (): Error | undefined => {
+        if (resourcesClosed) return undefined;
+        resourcesClosed = true;
+        try {
+            closeResources();
+            return undefined;
+        } catch (error) {
+            return error as Error;
+        }
+    };
+
+    const forceShutdown = (reason: string): void => {
+        if (shutdownFinished) return;
+        shutdownFinished = true;
+        console.error(reason);
+        listener.closeAllConnections();
+        const resourceError = closeResourcesOnce();
+        if (resourceError) console.error('Failed to close OAuth state store:', resourceError.message);
+        process.exit(1);
+    };
+
+    const beginShutdown = (signal: NodeJS.Signals): void => {
+        if (shutdownStarted) {
+            forceShutdown(`Received ${signal} while shutting down; forcing HTTP server closure.`);
+            return;
+        }
+        shutdownStarted = true;
+        console.log(`Received ${signal}; stopping HTTP accepts and draining active requests.`);
+
+        const deadline = setTimeout(() => {
+            forceShutdown(`HTTP shutdown deadline of ${timeoutMs}ms expired; forcing active connections closed.`);
+        }, timeoutMs);
+
+        listener.close(error => {
+            if (shutdownFinished) return;
+            shutdownFinished = true;
+            clearTimeout(deadline);
+            const resourceError = closeResourcesOnce();
+            if (error) console.error('HTTP server close failed:', error.message);
+            if (resourceError) console.error('Failed to close OAuth state store:', resourceError.message);
+            process.exitCode = error || resourceError ? 1 : 0;
+            console.log('HTTP server shutdown complete.');
+        });
+        listener.closeIdleConnections();
+    };
+
+    process.once('SIGTERM', beginShutdown);
+    process.once('SIGINT', beginShutdown);
 }
 
 // Type definitions for Gmail API responses
@@ -223,300 +325,6 @@ interface EmailContent {
 // OAuth2 configuration
 let oauth2Client: OAuth2Client;
 let authorizedScopes: string[] = DEFAULT_SCOPES;
-
-const REMOTE_MCP_SCOPE = "gmail";
-const AUTH_CODE_TTL_MS = 5 * 60 * 1000;
-const ACCESS_TOKEN_TTL_MS = 60 * 60 * 1000;
-const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-
-interface RegisteredOAuthClient {
-    clientId: string;
-    redirectUris: string[];
-    clientName?: string;
-    createdAt: number;
-}
-
-interface PendingAuthCode {
-    clientId: string;
-    redirectUri: string;
-    codeChallenge: string;
-    codeChallengeMethod: string;
-    scope: string;
-    expiresAt: number;
-}
-
-interface IssuedRemoteToken {
-    token: string;
-    scope: string;
-    expiresAt: number;
-}
-
-interface IssuedRefreshToken {
-    token: string;
-    clientId: string;
-    scope: string;
-    expiresAt: number;
-}
-
-const registeredOAuthClients = new Map<string, RegisteredOAuthClient>();
-const pendingAuthCodes = new Map<string, PendingAuthCode>();
-const issuedAccessTokens = new Map<string, IssuedRemoteToken>();
-const issuedRefreshTokens = new Map<string, IssuedRefreshToken>();
-
-function getConfiguredRemoteApiKey(): string | undefined {
-    const apiKey = process.env.GMAIL_MCP_API_KEY?.trim();
-    return apiKey || undefined;
-}
-
-function getConfiguredPublicBaseUrl(): string | undefined {
-    const raw = (process.env.GMAIL_MCP_PUBLIC_URL || process.env.MCP_PUBLIC_URL)?.trim();
-    if (!raw) return undefined;
-
-    try {
-        const url = new URL(raw);
-        url.search = "";
-        url.hash = "";
-        if (url.pathname.endsWith("/mcp")) {
-            url.pathname = url.pathname.slice(0, -"/mcp".length) || "/";
-        }
-        return url.toString().replace(/\/$/, "");
-    } catch {
-        return raw.replace(/\/mcp\/?$/, "").replace(/\/$/, "");
-    }
-}
-
-function getRequestBaseUrl(req: express.Request): string {
-    const configured = getConfiguredPublicBaseUrl();
-    if (configured) return configured;
-
-    const forwardedProto = req.get("x-forwarded-proto")?.split(",")[0]?.trim();
-    const forwardedHost = req.get("x-forwarded-host")?.split(",")[0]?.trim();
-    const proto = forwardedProto || req.protocol || "http";
-    const host = forwardedHost || req.get("host") || "localhost";
-    return `${proto}://${host}`;
-}
-
-function getProtectedResourceMetadataUrl(req: express.Request): string {
-    return `${getRequestBaseUrl(req)}/.well-known/oauth-protected-resource/mcp`;
-}
-
-function getMcpResourceUrl(req: express.Request): string {
-    return `${getRequestBaseUrl(req)}/mcp`;
-}
-
-function oauthAuthorizationServerMetadata(req: express.Request) {
-    const baseUrl = getRequestBaseUrl(req);
-    return {
-        issuer: baseUrl,
-        authorization_endpoint: `${baseUrl}/authorize`,
-        token_endpoint: `${baseUrl}/token`,
-        registration_endpoint: `${baseUrl}/register`,
-        response_types_supported: ["code"],
-        grant_types_supported: ["authorization_code", "refresh_token"],
-        token_endpoint_auth_methods_supported: ["none"],
-        code_challenge_methods_supported: ["S256"],
-        scopes_supported: [REMOTE_MCP_SCOPE, "offline_access"],
-    };
-}
-
-function protectedResourceMetadata(req: express.Request) {
-    return {
-        resource: getMcpResourceUrl(req),
-        authorization_servers: [getRequestBaseUrl(req)],
-        bearer_methods_supported: ["header"],
-        scopes_supported: [REMOTE_MCP_SCOPE],
-    };
-}
-
-function timingSafeStringEquals(left: string, right: string): boolean {
-    const leftBuffer = Buffer.from(left);
-    const rightBuffer = Buffer.from(right);
-    if (leftBuffer.length !== rightBuffer.length) return false;
-    return timingSafeEqual(leftBuffer, rightBuffer);
-}
-
-function randomToken(): string {
-    return randomBytes(32).toString("base64url");
-}
-
-function base64Url(input: Buffer): string {
-    return input.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function pkceS256(verifier: string): string {
-    return base64Url(createHash("sha256").update(verifier).digest());
-}
-
-function cleanupRemoteAuthStores() {
-    const now = Date.now();
-    for (const [code, record] of pendingAuthCodes) {
-        if (record.expiresAt <= now) pendingAuthCodes.delete(code);
-    }
-    for (const [token, record] of issuedAccessTokens) {
-        if (record.expiresAt <= now) issuedAccessTokens.delete(token);
-    }
-    for (const [token, record] of issuedRefreshTokens) {
-        if (record.expiresAt <= now) issuedRefreshTokens.delete(token);
-    }
-}
-
-function extractBearerToken(req: express.Request): string | undefined {
-    const authHeader = req.headers.authorization;
-    if (authHeader?.startsWith("Bearer ")) {
-        return authHeader.substring("Bearer ".length).trim();
-    }
-    return undefined;
-}
-
-function queryValue(value: unknown): string | undefined {
-    return typeof value === "string" ? value : undefined;
-}
-
-function isRemoteRequestAuthorized(req: express.Request): boolean {
-    cleanupRemoteAuthStores();
-
-    const apiKey = getConfiguredRemoteApiKey();
-    const bearer = extractBearerToken(req);
-    if (bearer) {
-        if (apiKey && timingSafeStringEquals(bearer, apiKey)) {
-            return true;
-        }
-        const issued = issuedAccessTokens.get(bearer);
-        if (issued && issued.expiresAt > Date.now()) {
-            return true;
-        }
-    }
-
-    const queryApiKey = queryValue(req.query.api_key);
-    return !!(apiKey && queryApiKey && timingSafeStringEquals(queryApiKey, apiKey));
-}
-
-function sendRemoteAuthChallenge(req: express.Request, res: express.Response): void {
-    const header =
-        `Bearer error="invalid_token", ` +
-        `error_description="Authentication required", ` +
-        `resource_metadata="${getProtectedResourceMetadataUrl(req)}", ` +
-        `scope="${REMOTE_MCP_SCOPE}"`;
-
-    res
-        .status(401)
-        .set("WWW-Authenticate", header)
-        .json({
-            error: "invalid_token",
-            error_description: "Authentication required",
-        });
-}
-
-function noStore(res: express.Response): express.Response {
-    return res.set("Cache-Control", "no-store").set("Pragma", "no-cache");
-}
-
-function escapeHtml(value: string): string {
-    return value.replace(/[&<>"']/g, (char) => {
-        switch (char) {
-            case "&": return "&amp;";
-            case "<": return "&lt;";
-            case ">": return "&gt;";
-            case '"': return "&quot;";
-            case "'": return "&#39;";
-            default: return char;
-        }
-    });
-}
-
-function renderAuthorizeForm(params: Record<string, string>, error?: string): string {
-    const hiddenInputs = Object.entries(params)
-        .map(([name, value]) => `<input type="hidden" name="${escapeHtml(name)}" value="${escapeHtml(value)}">`)
-        .join("\n");
-
-    const errorMarkup = error ? `<p class="error">${escapeHtml(error)}</p>` : "";
-
-    return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Authorize Gmail MCP</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 34rem; margin: 4rem auto; padding: 0 1rem; color: #1f2937; }
-    label { display: block; font-weight: 600; margin-bottom: 0.5rem; }
-    input[type="password"] { width: 100%; box-sizing: border-box; padding: 0.7rem; border: 1px solid #9ca3af; border-radius: 6px; }
-    button { margin-top: 1rem; padding: 0.65rem 0.9rem; border: 0; border-radius: 6px; background: #1f2937; color: white; font-weight: 600; cursor: pointer; }
-    .error { color: #b91c1c; font-weight: 600; }
-    .hint { color: #4b5563; font-size: 0.95rem; line-height: 1.45; }
-  </style>
-</head>
-<body>
-  <h1>Authorize Gmail MCP</h1>
-  <p class="hint">Enter the server API key to allow this Claude connector to use the Gmail MCP server.</p>
-  ${errorMarkup}
-  <form method="post" action="/authorize">
-    ${hiddenInputs}
-    <label for="api_key">Server API key</label>
-    <input id="api_key" name="api_key" type="password" autocomplete="current-password" required autofocus>
-    <button type="submit">Authorize</button>
-  </form>
-</body>
-</html>`;
-}
-
-function renderGmailOAuthResultPage(success: boolean, message: string): string {
-    const title = success ? 'Gmail authentication successful' : 'Gmail authentication failed';
-    const color = success ? '#166534' : '#b91c1c';
-
-    return `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>${escapeHtml(title)}</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 34rem; margin: 4rem auto; padding: 0 1rem; color: #1f2937; }
-    h1 { color: ${color}; }
-    p { line-height: 1.5; }
-  </style>
-</head>
-<body>
-  <h1>${escapeHtml(title)}</h1>
-  <p>${escapeHtml(message)}</p>
-</body>
-</html>`;
-}
-
-function issueRemoteTokens(clientId: string, scope: string) {
-    cleanupRemoteAuthStores();
-
-    const accessToken = randomToken();
-    const refreshToken = randomToken();
-    const now = Date.now();
-
-    issuedAccessTokens.set(accessToken, {
-        token: accessToken,
-        scope,
-        expiresAt: now + ACCESS_TOKEN_TTL_MS,
-    });
-    issuedRefreshTokens.set(refreshToken, {
-        token: refreshToken,
-        clientId,
-        scope,
-        expiresAt: now + REFRESH_TOKEN_TTL_MS,
-    });
-
-    return {
-        access_token: accessToken,
-        refresh_token: refreshToken,
-        token_type: "Bearer",
-        expires_in: Math.floor(ACCESS_TOKEN_TTL_MS / 1000),
-        scope,
-    };
-}
-
-function sendOAuthError(res: express.Response, status: number, error: string, description: string): void {
-    noStore(res).status(status).json({
-        error,
-        error_description: description,
-    });
-}
 
 /**
  * Recursively extract email body content from MIME message parts
@@ -683,7 +491,7 @@ async function main() {
     }
 
     // Initialize Gmail API
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
+    const gmail = createGmailClient({ version: 'v1', auth: oauth2Client });
 
     interface McpServerOptions {
         gmailOAuthPublicBaseUrl?: string;
@@ -726,6 +534,7 @@ async function main() {
         const toolDef = getToolByName(name);
         if (!toolDef) {
             return {
+                isError: true,
                 content: [{
                     type: "text",
                     text: `Error: Tool "${name}" is not found.`,
@@ -772,6 +581,7 @@ async function main() {
                 };
             } catch (error: any) {
                 return {
+                    isError: true,
                     content: [{
                         type: "text",
                         text: `Error starting Gmail OAuth: ${error.message}`,
@@ -786,6 +596,7 @@ async function main() {
             gmailClientInfo = await getAccountClient(validatedArgs?.account);
         } catch (error) {
             return {
+                isError: true,
                 content: [{
                     type: "text",
                     text: `Error resolving Gmail client: ${(error as any).message}`,
@@ -797,6 +608,7 @@ async function main() {
 
         if (!hasScope(authorizedScopes, toolDef.scopes)) {
             return {
+                isError: true,
                 content: [{
                     type: "text",
                     text: `Error: Tool "${name}" is not authorized for the scopes available on account "${validatedArgs?.account || 'primary'}". Authorized scopes: ${authorizedScopes.join(', ')}`,
@@ -1007,7 +819,9 @@ async function main() {
                     const scheduleArgs = ScheduleEmailSchema.parse(args);
                     const targetTime = parseScheduledTime(scheduleArgs.scheduledTime);
                     
-                    let account = scheduleArgs.account;
+                    let account = scheduleArgs.account
+                        ? canonicalizeAccountEmail(scheduleArgs.account)
+                        : undefined;
                     if (!account) {
                         const accounts = listAuthenticatedAccounts();
                         account = accounts[0] || "default";
@@ -1025,15 +839,12 @@ async function main() {
                         bcc: scheduleArgs.bcc,
                         threadId: scheduleArgs.threadId,
                         inReplyTo: scheduleArgs.inReplyTo,
-                        attachments: scheduleArgs.attachments,
                         scheduledTime: targetTime,
                         status: 'pending',
                         attempts: 0
                     };
                     
-                    const queue = loadQueue();
-                    queue.push(newEmail);
-                    saveQueue(queue);
+                    enqueueScheduledEmail(newEmail, scheduleArgs.attachments ?? []);
                     
                     return {
                         content: [{
@@ -1060,24 +871,34 @@ async function main() {
 
                 case "cancel_scheduled_email": {
                     const cancelArgs = CancelScheduledEmailSchema.parse(args);
-                    const queue = loadQueue();
-                    const initialLength = queue.length;
-                    const filtered = queue.filter(e => e.id !== cancelArgs.id);
-                    
-                    if (filtered.length === initialLength) {
+                    if (!cancelScheduledEmail(cancelArgs.id)) {
                         return {
+                            isError: true,
                             content: [{
                                 type: "text",
-                                text: `Error: Scheduled email with ID "${cancelArgs.id}" not found.`,
+                                text: `Error: Scheduled email with ID "${cancelArgs.id}" was not found or is no longer pending.`,
                             }],
                         };
                     }
                     
-                    saveQueue(filtered);
                     return {
                         content: [{
                             type: "text",
                             text: `Successfully cancelled scheduled email with ID "${cancelArgs.id}".`,
+                        }],
+                    };
+                }
+                case "resolve_uncertain_scheduled_email": {
+                    const resolveArgs = ResolveUncertainScheduledEmailSchema.parse(args);
+                    const resolved = resolveUncertainScheduledEmail(
+                        resolveArgs.id,
+                        resolveArgs.outcome,
+                        resolveArgs.gmailMessageId,
+                    );
+                    return {
+                        content: [{
+                            type: "text",
+                            text: JSON.stringify(resolved, null, 2),
                         }],
                     };
                 }
@@ -1165,11 +986,6 @@ async function main() {
                     const { messageId, savePath, format } = validatedArgs;
 
                     try {
-                        // Ensure save directory exists
-                        if (!fs.existsSync(savePath)) {
-                            fs.mkdirSync(savePath, { recursive: true });
-                        }
-
                         // Always fetch full message for metadata (needed for attachments list)
                         const fullResponse = await gmail.users.messages.get({
                             userId: "me",
@@ -1205,17 +1021,17 @@ async function main() {
                             }
                         }
 
-                        // Write file
-                        const filename = `${messageId}.${format}`;
-                        const fullPath = path.join(savePath, filename);
-                        fs.writeFileSync(fullPath, content, "utf-8");
-                        const stats = fs.statSync(fullPath);
+                        const filename = safeSuggestedFilename(
+                            `${messageId}.${format}`,
+                            `email.${format}`,
+                        );
+                        const exported = writeManagedExportFile(filename, content, savePath, CONFIG_DIR);
 
                         // Return metadata with attachments
                         const result = {
                             status: "saved",
-                            path: fullPath,
-                            size: stats.size,
+                            path: exported.path,
+                            size: exported.size,
                             messageId,
                             subject,
                             from,
@@ -1233,6 +1049,7 @@ async function main() {
                         };
                     } catch (error: any) {
                         return {
+                            isError: true,
                             content: [
                                 {
                                     type: "text",
@@ -1792,10 +1609,15 @@ async function main() {
 
                         // Decode the base64 data
                         const data = attachmentResponse.data.data;
+                        const estimatedDecodedBytes = Math.floor(data.length * 3 / 4);
+                        if (estimatedDecodedBytes > MAX_MANAGED_EXPORT_FILE_BYTES) {
+                            throw new Error(
+                                `Attachment exceeds the ${MAX_MANAGED_EXPORT_FILE_BYTES}-byte managed export limit.`,
+                            );
+                        }
                         const buffer = Buffer.from(data, 'base64url');
 
-                        // Determine save path and filename
-                        const savePath = validatedArgs.savePath || process.cwd();
+                        // Determine the filename. The destination is always the managed export root.
                         let filename = validatedArgs.filename;
 
                         if (!filename) {
@@ -1823,32 +1645,30 @@ async function main() {
                             filename = findAttachment(messageResponse.data.payload) || `attachment-${validatedArgs.attachmentId}`;
                         }
 
-                        // Sanitize filename to prevent path traversal
-                        filename = path.basename(filename);
-
-                        // Ensure save directory exists
-                        if (!fs.existsSync(savePath)) {
-                            fs.mkdirSync(savePath, { recursive: true });
-                        }
-
-                        // Resolve and validate final path stays within savePath
-                        const resolvedSavePath = path.resolve(savePath);
-                        const fullPath = path.resolve(resolvedSavePath, filename);
-                        if (!fullPath.startsWith(resolvedSavePath + path.sep) && fullPath !== resolvedSavePath) {
-                            throw new Error('Invalid filename: path traversal detected');
-                        }
-                        fs.writeFileSync(fullPath, buffer);
+                        filename = validatedArgs.filename
+                            ? validateManagedExportFilename(filename)
+                            : safeSuggestedFilename(
+                                filename,
+                                `attachment-${validatedArgs.attachmentId}`,
+                            );
+                        const exported = writeManagedExportFile(
+                            filename,
+                            buffer,
+                            validatedArgs.savePath,
+                            CONFIG_DIR,
+                        );
 
                         return {
                             content: [
                                 {
                                     type: "text",
-                                    text: `Attachment downloaded successfully:\nFile: ${filename}\nSize: ${buffer.length} bytes\nSaved to: ${fullPath}`,
+                                    text: `Attachment downloaded successfully:\nFile: ${path.basename(exported.path)}\nSize: ${exported.size} bytes\nSaved to: ${exported.path}`,
                                 },
                             ],
                         };
                     } catch (error: any) {
                         return {
+                            isError: true,
                             content: [
                                 {
                                     type: "text",
@@ -2230,6 +2050,7 @@ async function main() {
             }
         } catch (error: any) {
             return {
+                isError: true,
                 content: [
                     {
                         type: "text",
@@ -2243,302 +2064,74 @@ async function main() {
         return server;
     }
 
-    if (process.argv.includes('--sse')) {
-        const portArg = process.argv.find(arg => arg.startsWith('--port='));
-        const port = portArg ? parseInt(portArg.slice('--port='.length), 10) : 8080;
-        
-        const app = express();
-        app.set("trust proxy", true);
-        const activeTransports = new Map<string, SSEServerTransport>();
-
-        const apiKey = process.env.GMAIL_MCP_API_KEY;
-        if (apiKey) {
-            console.log("Securing remote MCP endpoints with GMAIL_MCP_API_KEY-backed OAuth.");
+    const legacySseFlag = process.argv.includes('--sse');
+    if (process.argv.includes('--http') || legacySseFlag) {
+        if (legacySseFlag) {
+            console.warn('--sse is a deprecated alias for Streamable HTTP; use --http and connect to /mcp.');
+        }
+        const readCliOption = (name: string, fallback: string): string => {
+            const inline = process.argv.find(arg => arg.startsWith(`--${name}=`));
+            if (inline) return inline.slice(name.length + 3);
+            const index = process.argv.indexOf(`--${name}`);
+            return index >= 0 && process.argv[index + 1] ? process.argv[index + 1] : fallback;
+        };
+        const host = readCliOption('host', '127.0.0.1');
+        const port = Number(readCliOption('port', '8080'));
+        if (!host.trim()) throw new Error('--host must not be empty.');
+        if (!Number.isInteger(port) || port < 1 || port > 65535) {
+            throw new Error('--port must be an integer between 1 and 65535.');
         }
 
-        const requireRemoteAuth = (req: express.Request, res: express.Response, next: express.NextFunction) => {
-            if (apiKey && !isRemoteRequestAuthorized(req)) {
-                sendRemoteAuthChallenge(req, res);
-                return;
-            }
-            next();
-        };
+        const config = loadRemoteServerConfig();
+        const stateStore = getDefaultOAuthStateStore();
+        stateStore.cleanupExpired();
 
-        const readAuthorizeParams = (source: Record<string, any>) => ({
-            response_type: queryValue(source.response_type) || "",
-            client_id: queryValue(source.client_id) || "",
-            redirect_uri: queryValue(source.redirect_uri) || "",
-            scope: queryValue(source.scope) || REMOTE_MCP_SCOPE,
-            state: queryValue(source.state) || "",
-            code_challenge: queryValue(source.code_challenge) || "",
-            code_challenge_method: queryValue(source.code_challenge_method) || "",
-        });
-
-        const validateAuthorizeParams = (params: ReturnType<typeof readAuthorizeParams>): string | undefined => {
-            if (params.response_type !== "code") {
-                return "Unsupported response_type.";
-            }
-            const client = registeredOAuthClients.get(params.client_id);
-            if (!client) {
-                return "Unknown OAuth client.";
-            }
-            if (!client.redirectUris.includes(params.redirect_uri)) {
-                return "redirect_uri is not registered for this OAuth client.";
-            }
-            try {
-                new URL(params.redirect_uri);
-            } catch {
-                return "redirect_uri must be an absolute URL.";
-            }
-            if (!params.code_challenge || params.code_challenge_method !== "S256") {
-                return "PKCE S256 is required.";
-            }
-            return undefined;
-        };
-
-        app.get("/.well-known/oauth-protected-resource", (req, res) => {
-            res.json(protectedResourceMetadata(req));
-        });
-
-        app.get("/.well-known/oauth-protected-resource/mcp", (req, res) => {
-            res.json(protectedResourceMetadata(req));
-        });
-
-        app.get(["/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"], (req, res) => {
-            res.json(oauthAuthorizationServerMetadata(req));
-        });
-
-        app.post("/register", express.json({ type: ["application/json", "application/*+json"] }), (req, res) => {
-            const redirectUris = Array.isArray(req.body?.redirect_uris)
-                ? req.body.redirect_uris.filter((uri: unknown): uri is string => typeof uri === "string")
-                : [];
-
-            if (redirectUris.length === 0) {
-                sendOAuthError(res, 400, "invalid_client_metadata", "redirect_uris must contain at least one URI.");
-                return;
-            }
-
-            const createdAt = Date.now();
-            const clientId = `client_${randomUUID()}`;
-            const client: RegisteredOAuthClient = {
-                clientId,
-                redirectUris,
-                clientName: typeof req.body?.client_name === "string" ? req.body.client_name : undefined,
-                createdAt,
-            };
-            registeredOAuthClients.set(clientId, client);
-
-            noStore(res).status(201).json({
-                client_id: clientId,
-                client_id_issued_at: Math.floor(createdAt / 1000),
-                redirect_uris: redirectUris,
-                grant_types: ["authorization_code", "refresh_token"],
-                response_types: ["code"],
-                token_endpoint_auth_method: "none",
-            });
-        });
-
-        app.get("/authorize", (req, res) => {
-            const params = readAuthorizeParams(req.query as Record<string, any>);
-            const validationError = validateAuthorizeParams(params);
-            if (validationError) {
-                res.status(400).send(validationError);
-                return;
-            }
-            res.type("html").send(renderAuthorizeForm(params));
-        });
-
-        app.post("/authorize", express.urlencoded({ extended: false }), (req, res) => {
-            const params = readAuthorizeParams(req.body as Record<string, any>);
-            const validationError = validateAuthorizeParams(params);
-            if (validationError) {
-                res.status(400).send(validationError);
-                return;
-            }
-
-            const configuredKey = getConfiguredRemoteApiKey();
-            const submittedKey = typeof req.body?.api_key === "string" ? req.body.api_key : "";
-            if (!configuredKey || !submittedKey || !timingSafeStringEquals(submittedKey, configuredKey)) {
-                res.status(401).type("html").send(renderAuthorizeForm(params, "Invalid API key."));
-                return;
-            }
-
-            const code = randomToken();
-            pendingAuthCodes.set(code, {
-                clientId: params.client_id,
-                redirectUri: params.redirect_uri,
-                codeChallenge: params.code_challenge,
-                codeChallengeMethod: params.code_challenge_method,
-                scope: REMOTE_MCP_SCOPE,
-                expiresAt: Date.now() + AUTH_CODE_TTL_MS,
-            });
-
-            const redirectUrl = new URL(params.redirect_uri);
-            redirectUrl.searchParams.set("code", code);
-            if (params.state) {
-                redirectUrl.searchParams.set("state", params.state);
-            }
-            res.redirect(302, redirectUrl.toString());
-        });
-
-        app.get("/oauth2callback", async (req, res) => {
-            const googleError = queryValue(req.query.error);
-            if (googleError) {
-                noStore(res)
-                    .status(400)
-                    .type("html")
-                    .send(renderGmailOAuthResultPage(false, `Google OAuth failed: ${googleError}`));
-                return;
-            }
-
-            try {
-                const result = await completeGmailOAuthCallback({
-                    code: queryValue(req.query.code),
-                    state: queryValue(req.query.state),
+        const app = createRemoteHttpApp(config, stateStore, {
+            completeGmailOAuthCallback: params => completeGmailOAuthCallback({
+                ...params,
+                stateStore,
+            }),
+            handleMcpRequest: async (req, res) => {
+                const transport = new StreamableHTTPServerTransport({
+                    sessionIdGenerator: undefined,
+                    enableJsonResponse: true,
+                });
+                const sessionServer = createMcpServer({
+                    gmailOAuthPublicBaseUrl: config.issuerUrl,
                 });
 
-                noStore(res)
-                    .status(200)
-                    .type("html")
-                    .send(renderGmailOAuthResultPage(
-                        true,
-                        `Gmail authentication successful for ${result.accountEmail}; you can return to Claude/Cowork.`,
-                    ));
-            } catch (error) {
-                const message = error instanceof Error ? error.message : "Gmail authentication failed.";
-                const status = error instanceof GmailOAuthError ? error.statusCode : 500;
-                noStore(res)
-                    .status(status)
-                    .type("html")
-                    .send(renderGmailOAuthResultPage(false, message));
-            }
+                try {
+                    await sessionServer.connect(transport);
+                    await transport.handleRequest(req, res, req.body);
+                } catch (error) {
+                    console.error('Streamable HTTP MCP request failed:', (error as Error).message);
+                    if (!res.headersSent) {
+                        res.status(500).json({
+                            jsonrpc: '2.0',
+                            error: { code: -32603, message: 'Internal error' },
+                            id: null,
+                        });
+                    }
+                } finally {
+                    try {
+                        await sessionServer.close();
+                    } catch {
+                        // The request response has already been finalized.
+                    }
+                }
+            },
         });
 
-        app.post("/token", express.urlencoded({ extended: false }), (req, res) => {
-            cleanupRemoteAuthStores();
-
-            const grantType = req.body?.grant_type;
-            if (grantType === "authorization_code") {
-                const codeValue = typeof req.body?.code === "string" ? req.body.code : "";
-                const code = pendingAuthCodes.get(codeValue);
-                if (!code || code.expiresAt <= Date.now()) {
-                    sendOAuthError(res, 400, "invalid_grant", "Authorization code is invalid or expired.");
-                    return;
-                }
-
-                const clientId = typeof req.body?.client_id === "string" ? req.body.client_id : "";
-                const redirectUri = typeof req.body?.redirect_uri === "string" ? req.body.redirect_uri : "";
-                const codeVerifier = typeof req.body?.code_verifier === "string" ? req.body.code_verifier : "";
-
-                if (clientId !== code.clientId || redirectUri !== code.redirectUri) {
-                    sendOAuthError(res, 400, "invalid_grant", "Authorization code client or redirect_uri mismatch.");
-                    return;
-                }
-                if (!codeVerifier || pkceS256(codeVerifier) !== code.codeChallenge) {
-                    sendOAuthError(res, 400, "invalid_grant", "PKCE verification failed.");
-                    return;
-                }
-
-                pendingAuthCodes.delete(codeValue);
-                noStore(res).json(issueRemoteTokens(clientId, code.scope));
-                return;
-            }
-
-            if (grantType === "refresh_token") {
-                const refreshTokenValue = typeof req.body?.refresh_token === "string" ? req.body.refresh_token : "";
-                const refreshToken = issuedRefreshTokens.get(refreshTokenValue);
-                if (!refreshToken || refreshToken.expiresAt <= Date.now()) {
-                    sendOAuthError(res, 400, "invalid_grant", "Refresh token is invalid or expired.");
-                    return;
-                }
-
-                const clientId = typeof req.body?.client_id === "string" ? req.body.client_id : "";
-                if (clientId && clientId !== refreshToken.clientId) {
-                    sendOAuthError(res, 400, "invalid_grant", "Refresh token client mismatch.");
-                    return;
-                }
-
-                issuedRefreshTokens.delete(refreshTokenValue);
-                noStore(res).json(issueRemoteTokens(refreshToken.clientId, refreshToken.scope));
-                return;
-            }
-
-            sendOAuthError(res, 400, "unsupported_grant_type", "Only authorization_code and refresh_token grants are supported.");
-        });
-
-        app.all("/mcp", express.json({ type: ["application/json", "application/*+json"] }), async (req, res) => {
-            if (apiKey && !isRemoteRequestAuthorized(req)) {
-                sendRemoteAuthChallenge(req, res);
-                return;
-            }
-
-            const transport = new StreamableHTTPServerTransport({
-                sessionIdGenerator: undefined,
-                enableJsonResponse: true,
+        const listener = await new Promise<HttpServer>((resolve, reject) => {
+            const listener = app.listen(port, host);
+            listener.once('error', reject);
+            listener.once('listening', () => {
+                console.log(`Gmail MCP Server listening on http://${host}:${port}`);
+                console.log(`Streamable HTTP endpoint: ${config.resourceUrl}`);
+                resolve(listener);
             });
-            const sessionServer = createMcpServer({ gmailOAuthPublicBaseUrl: getRequestBaseUrl(req) });
-
-            try {
-                await sessionServer.connect(transport);
-                await transport.handleRequest(req, res, req.body);
-            } catch (error) {
-                console.error("Streamable HTTP MCP request failed:", (error as any).message);
-                if (!res.headersSent) {
-                    res.status(500).json({
-                        jsonrpc: "2.0",
-                        error: { code: -32603, message: "Internal error" },
-                        id: null,
-                    });
-                }
-            } finally {
-                try {
-                    await sessionServer.close();
-                } catch {
-                    // Ignore errors during close
-                }
-            }
         });
-
-        app.get("/sse", requireRemoteAuth, async (req, res) => {
-            console.log(`Client connecting to ${req.path}...`);
-            const queryApiKey = queryValue(req.query.api_key);
-            const endpoint = apiKey && queryApiKey && timingSafeStringEquals(queryApiKey, apiKey)
-                ? `/messages?api_key=${encodeURIComponent(queryApiKey)}`
-                : "/messages";
-            const transport = new SSEServerTransport(endpoint, res);
-            
-            const sessionServer = createMcpServer({ gmailOAuthPublicBaseUrl: getRequestBaseUrl(req) });
-            
-            activeTransports.set(transport.sessionId, transport);
-            transport.onclose = async () => {
-                console.log(`SSE transport closed for session ${transport.sessionId}`);
-                activeTransports.delete(transport.sessionId);
-                try {
-                    await sessionServer.close();
-                } catch (e) {
-                    // Ignore errors during close
-                }
-            };
-
-            await sessionServer.connect(transport);
-            console.log(`SSE transport connected for session ${transport.sessionId}`);
-        });
-
-        app.post("/messages", requireRemoteAuth, express.json(), async (req, res) => {
-            const sessionId = req.query.sessionId as string;
-            const transport = activeTransports.get(sessionId);
-            if (transport) {
-                await transport.handlePostMessage(req, res);
-            } else {
-                res.status(400).send("Invalid session ID or session has expired");
-            }
-        });
-
-        app.listen(port, () => {
-            console.log(`Gmail MCP Server successfully started in remote mode on port ${port}`);
-            console.log(`Streamable HTTP endpoint: http://localhost:${port}/mcp`);
-            console.log(`Legacy SSE endpoint: http://localhost:${port}/sse`);
-        });
+        installGracefulHttpShutdown(listener, closeDefaultOAuthStateStore);
     } else {
         const server = createMcpServer();
         const transport = new StdioServerTransport();

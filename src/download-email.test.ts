@@ -193,18 +193,18 @@ describe("DownloadEmailSchema", () => {
   it("accepts valid input with all fields", () => {
     const result = DownloadEmailSchema.parse({
       messageId: "msg123",
-      savePath: "/tmp/emails",
+      savePath: "emails/archive",
       format: "json",
     });
     expect(result.messageId).toBe("msg123");
-    expect(result.savePath).toBe("/tmp/emails");
+    expect(result.savePath).toBe("emails/archive");
     expect(result.format).toBe("json");
   });
 
   it("defaults format to json", () => {
     const result = DownloadEmailSchema.parse({
       messageId: "msg123",
-      savePath: "/tmp/emails",
+      savePath: "emails/archive",
     });
     expect(result.format).toBe("json");
   });
@@ -213,7 +213,7 @@ describe("DownloadEmailSchema", () => {
     for (const fmt of ["json", "eml", "txt", "html"]) {
       const result = DownloadEmailSchema.parse({
         messageId: "msg123",
-        savePath: "/tmp",
+        savePath: "formats",
         format: fmt,
       });
       expect(result.format).toBe(fmt);
@@ -224,7 +224,7 @@ describe("DownloadEmailSchema", () => {
     expect(() =>
       DownloadEmailSchema.parse({
         messageId: "msg123",
-        savePath: "/tmp",
+        savePath: "formats",
         format: "xml",
       })
     ).toThrow();
@@ -232,14 +232,14 @@ describe("DownloadEmailSchema", () => {
 
   it("requires messageId", () => {
     expect(() =>
-      DownloadEmailSchema.parse({ savePath: "/tmp" })
+      DownloadEmailSchema.parse({ savePath: "emails" })
     ).toThrow();
   });
 
-  it("requires savePath", () => {
-    expect(() =>
-      DownloadEmailSchema.parse({ messageId: "msg123" })
-    ).toThrow();
+  it("defaults to the managed export root when savePath is omitted", () => {
+    const result = DownloadEmailSchema.parse({ messageId: "msg123" });
+    expect(result.savePath).toBeUndefined();
+    expect(result.format).toBe("json");
   });
 });
 

@@ -1,5 +1,25 @@
 import { z } from "zod";
 import { zodToJsonSchema } from "zod-to-json-schema";
+import {
+  MAX_ATTACHMENT_COUNT,
+  MAX_MANAGED_PATH_LENGTH,
+} from './managed-files.js';
+import {
+  MAX_SCHEDULED_BODY_CHARS,
+  MAX_SCHEDULED_RECIPIENTS,
+  MAX_SCHEDULED_SUBJECT_CHARS,
+} from './db.js';
+
+const convertToolSchema = zodToJsonSchema as unknown as (
+  schema: z.ZodTypeAny,
+) => Record<string, unknown>;
+
+const ManagedAttachmentPathsSchema = z.array(
+  z.string().min(1).max(MAX_MANAGED_PATH_LENGTH),
+).max(MAX_ATTACHMENT_COUNT).refine(
+  paths => new Set(paths).size === paths.length,
+  'Duplicate attachment paths are not allowed.',
+);
 
 // Schema definitions
 export const SendEmailSchema = z.object({
@@ -14,7 +34,7 @@ export const SendEmailSchema = z.object({
   bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
   threadId: z.string().optional().describe("Thread ID to reply to"),
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
-  attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
+  attachments: ManagedAttachmentPathsSchema.optional().describe("Files from the managed import/export library to attach. At most 10 unique paths; relative paths resolve under managed imports."),
 });
 
 export const ReadEmailSchema = z.object({
@@ -65,7 +85,7 @@ export const UpdateDraftSchema = z.object({
   bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
   threadId: z.string().optional().describe("Thread ID to reply to"),
   inReplyTo: z.string().optional().describe("Message ID being replied to"),
-  attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
+  attachments: ManagedAttachmentPathsSchema.optional().describe("Files from the managed import/export library to attach. At most 10 unique paths; relative paths resolve under managed imports."),
 });
 
 export const ListEmailLabelsSchema = z.object({
@@ -178,14 +198,14 @@ export const DownloadAttachmentSchema = z.object({
   account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageId: z.string().describe("ID of the email message containing the attachment"),
   attachmentId: z.string().describe("ID of the attachment to download"),
-  filename: z.string().optional().describe("Filename to save the attachment as (if not provided, uses original filename)"),
-  savePath: z.string().optional().describe("Directory path to save the attachment (defaults to current directory)"),
+  filename: z.string().min(1).max(240).optional().describe("Filename to use in the managed export library (defaults to the original filename)"),
+  savePath: z.string().max(MAX_MANAGED_PATH_LENGTH).optional().describe("Subdirectory of the managed export library (defaults to its root)"),
 });
 
 export const DownloadEmailSchema = z.object({
   account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
   messageId: z.string().describe("ID of the email message to download"),
-  savePath: z.string().describe("Directory path to save the email file"),
+  savePath: z.string().max(MAX_MANAGED_PATH_LENGTH).optional().describe("Subdirectory of the managed export library (defaults to its root)"),
   format: z.enum(['json', 'eml', 'txt', 'html']).optional().default('json')
     .describe("Output format: json (structured data), eml (raw RFC822), txt (plain text), html (formatted HTML)"),
 });
@@ -224,7 +244,7 @@ export const ReplyAllSchema = z.object({
   body: z.string().describe("Reply body content (used for text/plain or when htmlBody not provided)"),
   htmlBody: z.string().optional().describe("HTML version of the reply body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
-  attachments: z.array(z.string()).optional().describe("List of file paths to attach to the reply"),
+  attachments: ManagedAttachmentPathsSchema.optional().describe("Files from the managed import/export library to attach. At most 10 unique paths; relative paths resolve under managed imports."),
 });
 
 // --- NEW SCHEMAS FOR MULTI-ACCOUNT & SCHEDULING ---
@@ -233,25 +253,31 @@ export const ListAccountsSchema = z.object({}).describe("Lists all currently aut
 
 export const ScheduleEmailSchema = z.object({
   account: z.string().optional().describe("Gmail address of the authenticated account to use (e.g., 'user@gmail.com'). Defaults to the primary account if not specified."),
-  to: z.array(z.string()).describe("List of recipient email addresses"),
-  subject: z.string().describe("Email subject"),
-  body: z.string().describe("Email body content (used for text/plain or when htmlBody not provided)"),
-  htmlBody: z.string().optional().describe("HTML version of the email body"),
-  cc: z.array(z.string()).optional().describe("List of CC recipients"),
-  bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
-  threadId: z.string().optional().describe("Thread ID to reply to"),
-  inReplyTo: z.string().optional().describe("Message ID being replied to"),
-  attachments: z.array(z.string()).optional().describe("List of file paths to attach to the email"),
+  to: z.array(z.string().min(1).max(320)).min(1).max(MAX_SCHEDULED_RECIPIENTS).describe("List of recipient email addresses"),
+  subject: z.string().max(MAX_SCHEDULED_SUBJECT_CHARS).describe("Email subject"),
+  body: z.string().max(MAX_SCHEDULED_BODY_CHARS).describe("Email body content (used for text/plain or when htmlBody not provided)"),
+  htmlBody: z.string().max(MAX_SCHEDULED_BODY_CHARS).optional().describe("HTML version of the email body"),
+  cc: z.array(z.string().min(1).max(320)).max(MAX_SCHEDULED_RECIPIENTS).optional().describe("List of CC recipients"),
+  bcc: z.array(z.string().min(1).max(320)).max(MAX_SCHEDULED_RECIPIENTS).optional().describe("List of BCC recipients"),
+  threadId: z.string().max(2048).optional().describe("Thread ID to reply to"),
+  inReplyTo: z.string().max(2048).optional().describe("Message ID being replied to"),
+  attachments: ManagedAttachmentPathsSchema.optional().describe("Files from the managed import/export library to spool and attach. At most 10 unique paths and 25 MiB total."),
   scheduledTime: z.string().describe("ISO 8601 timestamp (e.g., '2026-05-28T15:00:00Z') or relative time string (e.g., '+5 minutes', '+2 hours', '+1 day') when the email should be sent."),
 });
 
 export const ListScheduledEmailsSchema = z.object({
-  status: z.enum(['pending', 'sent', 'failed']).optional().describe("Filter scheduled emails by status"),
+  status: z.enum(['pending', 'sending', 'sent', 'failed', 'uncertain']).optional().describe("Filter scheduled emails by status"),
 }).describe("Lists scheduled emails and their status");
 
 export const CancelScheduledEmailSchema = z.object({
   id: z.string().describe("The unique ID of the scheduled email to cancel"),
 }).describe("Cancels a pending scheduled email");
+
+export const ResolveUncertainScheduledEmailSchema = z.object({
+  id: z.string().regex(/^[A-Za-z0-9_-]{1,128}$/).describe("Scheduled email ID"),
+  outcome: z.enum(['sent', 'failed']).describe("Definitive delivery result after external reconciliation"),
+  gmailMessageId: z.string().max(2048).optional().describe("Optional Gmail message ID when outcome is sent"),
+}).describe("Resolves an uncertain scheduled delivery and releases its retained attachment bytes");
 
 export const AuthenticateAccountSchema = z.object({
   email: z.string().describe("The Gmail address of the account you want to authenticate/register (e.g., 'user@gmail.com')."),
@@ -270,7 +296,7 @@ export interface ToolAnnotations {
 export interface ToolDefinition {
   name: string;
   description: string;
-  schema: z.ZodType<any>;
+  schema: z.ZodTypeAny;
   scopes: string[]; // Any of these scopes grants access
   annotations: ToolAnnotations;
 }
@@ -294,10 +320,10 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "download_attachment",
-    description: "Downloads an email attachment to a specified location",
+    description: "Downloads an email attachment into the managed export library",
     schema: DownloadAttachmentSchema,
     scopes: ["gmail.readonly", "gmail.modify"],
-    annotations: { title: "Download Attachment", readOnlyHint: true },
+    annotations: { title: "Download Attachment", readOnlyHint: false, destructiveHint: false },
   },
 
   // Thread-level operations
@@ -331,10 +357,10 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "download_email",
-    description: "Downloads an email to a file in various formats (json, eml, txt, html). Returns metadata only - useful for saving emails without consuming context.",
+    description: "Downloads an email into the managed export library in json, eml, txt, or html format and returns file metadata.",
     schema: DownloadEmailSchema,
     scopes: ["gmail.readonly", "gmail.modify"],
-    annotations: { title: "Download Email", readOnlyHint: true },
+    annotations: { title: "Download Email", readOnlyHint: false, destructiveHint: false },
   },
 
   // Email write operations
@@ -516,7 +542,7 @@ export const toolDefinitions: ToolDefinition[] = [
   },
   {
     name: "list_scheduled_emails",
-    description: "Lists all scheduled emails in the local queue, along with their status (pending, sent, failed).",
+    description: "Lists all scheduled emails in the local queue, including terminal uncertain delivery outcomes.",
     schema: ListScheduledEmailsSchema,
     scopes: ["gmail.readonly", "gmail.modify"],
     annotations: { title: "List Scheduled Emails", readOnlyHint: true },
@@ -527,6 +553,13 @@ export const toolDefinitions: ToolDefinition[] = [
     schema: CancelScheduledEmailSchema,
     scopes: ["gmail.modify"],
     annotations: { title: "Cancel Scheduled Email", destructiveHint: true },
+  },
+  {
+    name: "resolve_uncertain_scheduled_email",
+    description: "Records a definitive sent/failed result for an uncertain scheduled email and cleans its retained attachment bytes. Uncertain messages are never retried automatically.",
+    schema: ResolveUncertainScheduledEmailSchema,
+    scopes: ["gmail.modify"],
+    annotations: { title: "Resolve Uncertain Scheduled Email", destructiveHint: true },
   },
   {
     name: "authenticate_account",
@@ -542,7 +575,7 @@ export function toMcpTools(tools: ToolDefinition[]) {
   return tools.map(tool => ({
     name: tool.name,
     description: tool.description,
-    inputSchema: zodToJsonSchema(tool.schema),
+    inputSchema: convertToolSchema(tool.schema),
     annotations: tool.annotations,
   }));
 }
