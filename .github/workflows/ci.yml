@@ -311,11 +311,19 @@ jobs:
             test -f /var/lib/gmail-mcp/.http-volume-check
             count=0
             for process in /proc/[0-9]*; do
-              if [ "$(cat "${process}/comm" 2>/dev/null || true)" = node ]; then
-                command=$(tr "\000" " " <"${process}/cmdline" 2>/dev/null || true)
-                [ "${command}" = "node dist/index.js scheduler " ] && count=$((count + 1))
-              fi
+              arguments=$(tr "\000" "\n" <"${process}/cmdline" 2>/dev/null || true)
+              executable=$(printf "%s\n" "${arguments}" | sed -n "1p")
+              entrypoint=$(printf "%s\n" "${arguments}" | sed -n "2p")
+              mode=$(printf "%s\n" "${arguments}" | sed -n "3p")
+              case "${executable}" in
+                node|*/node)
+                  [ "${entrypoint}" = "dist/index.js" ] \
+                    && [ "${mode}" = "scheduler" ] \
+                    && count=$((count + 1))
+                  ;;
+              esac
             done
+            printf "scheduler process count=%s\n" "${count}"
             test "${count}" -eq 1
           '
           docker compose logs --no-color gmail-mcp-scheduler | grep -Fq 'Starting Gmail MCP Scheduler Daemon'
