@@ -104,8 +104,11 @@ if [[ -e "${GMAIL_MCP_NGROK_ENV_FILE}" || -L "${GMAIL_MCP_NGROK_ENV_FILE}" ]]; t
 fi
 assert_supported_ubuntu
 source_dir="$(cd -- "${source_dir}" && pwd -P)"
-[[ -f "${source_dir}/package.json" && -f "${source_dir}/package-lock.json" ]] \
-    || die "not a Gmail MCP source checkout: ${source_dir}"
+[[ -f "${source_dir}/package.json" && -f "${source_dir}/package-lock.json" \
+    && -f "${source_dir}/tsconfig.json" && -f "${source_dir}/Dockerfile" \
+    && -f "${source_dir}/docker-compose.yml" \
+    && -f "${source_dir}/.dockerignore" ]] \
+    || die "not a complete Gmail MCP source checkout: ${source_dir}"
 [[ -d "${source_dir}/src" && -d "${source_dir}/deploy" ]] \
     || die 'source checkout is missing src or deploy'
 for managed_root in \
@@ -480,7 +483,9 @@ build_release() {
         rm -rf -- "${stage}"
         install -d -m 0755 "${stage}"
         cp -a -- "${source_dir}/package.json" "${source_dir}/package-lock.json" \
-            "${source_dir}/tsconfig.json" "${stage}/"
+            "${source_dir}/tsconfig.json" "${source_dir}/Dockerfile" \
+            "${source_dir}/docker-compose.yml" "${source_dir}/.dockerignore" \
+            "${stage}/"
         rsync -a \
             --exclude='__pycache__/' \
             --exclude='*.pyc' \

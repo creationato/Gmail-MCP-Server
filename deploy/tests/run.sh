@@ -1050,7 +1050,9 @@ for fixture in "${hash_fixture_a}" "${hash_fixture_b}"; do
     mkdir -p "${fixture}"
     cp -a -- "${install_source_root}/src" "${install_source_root}/deploy" \
         "${install_source_root}/package.json" "${install_source_root}/package-lock.json" \
-        "${install_source_root}/tsconfig.json" "${fixture}/"
+        "${install_source_root}/tsconfig.json" "${install_source_root}/Dockerfile" \
+        "${install_source_root}/docker-compose.yml" \
+        "${install_source_root}/.dockerignore" "${fixture}/"
 done
 mkdir -p "${hash_fixture_b}/deploy/lib/__pycache__"
 printf 'transient bytecode\n' >"${hash_fixture_b}/deploy/lib/__pycache__/envfile.cpython-test.pyc"
@@ -1058,6 +1060,11 @@ printf 'transient bytecode\n' >"${hash_fixture_b}/deploy/lib/__pycache__/envfile
     == "$(test_release_source_hash "${hash_fixture_b}")" ]] \
     && pass 'release hash is path-independent and ignores Python bytecode' \
     || fail 'release hash is path-independent and ignores Python bytecode'
+printf '\n# release hash regression fixture\n' >>"${hash_fixture_b}/docker-compose.yml"
+[[ "$(test_release_source_hash "${hash_fixture_a}")" \
+    != "$(test_release_source_hash "${hash_fixture_b}")" ]] \
+    && pass 'release hash includes packaged container deployment assets' \
+    || fail 'release hash includes packaged container deployment assets'
 install_hash="$(test_release_source_hash "${install_source_root}")"
 
 prepare_install_fixture() {

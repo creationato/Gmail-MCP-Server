@@ -747,7 +747,10 @@ compute_release_source_hash() {
     [[ -d "${source_root}/src" && -d "${source_root}/deploy" \
         && -f "${source_root}/package.json" \
         && -f "${source_root}/package-lock.json" \
-        && -f "${source_root}/tsconfig.json" ]] \
+        && -f "${source_root}/tsconfig.json" \
+        && -f "${source_root}/Dockerfile" \
+        && -f "${source_root}/docker-compose.yml" \
+        && -f "${source_root}/.dockerignore" ]] \
         || die "cannot hash incomplete Gmail MCP source: ${source_root}"
     (
         cd -- "${source_root}"
@@ -757,7 +760,8 @@ compute_release_source_hash() {
                 ! -name '*.pyc' \
                 ! -name '*.pyo' \
                 -print0
-            printf '%s\0' package.json package-lock.json tsconfig.json
+            printf '%s\0' package.json package-lock.json tsconfig.json \
+                Dockerfile docker-compose.yml .dockerignore
         } | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -c1-12
     )
 }

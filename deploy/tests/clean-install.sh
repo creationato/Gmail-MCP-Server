@@ -43,6 +43,9 @@ configure_root "${first_root}"
 
 current="${GMAIL_MCP_INSTALL_ROOT}/current"
 [[ -f ${current}/dist/index.js ]]
+[[ -f ${current}/Dockerfile ]]
+[[ -f ${current}/docker-compose.yml ]]
+[[ -f ${current}/.dockerignore ]]
 [[ -f ${GMAIL_MCP_SYSTEMD_DIR}/gmail-mcp.service ]]
 [[ -f ${GMAIL_MCP_SYSTEMD_DIR}/gmail-mcp-ngrok.service ]]
 [[ $(stat -c '%a' "${GMAIL_MCP_ENV_FILE}") == 600 ]]
